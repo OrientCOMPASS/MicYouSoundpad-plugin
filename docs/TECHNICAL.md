@@ -41,7 +41,7 @@ MicYou 原生插件 `opss.soundpad` 的实现说明：需求分解、宿主机�
 | 线程 | 职责 | 触碰的资源 | Host API |
 |---|---|---|---|
 | 宿主总线线程（init / deinit / handle_message / handle_event / interval tick） | 会话注册表、命令解析、回包、watchdog 对账、面板状态写入 | `STATE` 互斥锁、mixer 槽位控制面（reserve/stop/seek/gain/reclaim）、mpsc 发任务 | ✅ 仅此处（init/deinit 允许文件 I/O；消息处理路径零文件 I/O） |
-| 解码 worker（`soundpad-decode`，单线程） | 音频解码（WAV/symphonia 多格式）、重采样到 48k、目录重扫、轨道缓存、`publish`/`fail` 槽位交接、**本地输出设备开合与 play/pause**（`Job::LocalSet` + `LOCAL_WANTED` 3s 滞回门控）、**延迟配置落盘**（§6.5，唯一允许 worker 调 Host API 的窄例外，见 abi.rs 注释） | `JobResult` 原子量、`SoundRegistry`（Mutex<Vec> + version 计数）、mixer 槽位 LOADING 面、`LocalOut`（cpal Stream 属主） | ❌ 绝不调用 |
+| 解码 worker（`soundpad-decode`，单线程） | 音频解码（WAV/symphonia 多格式）、重采样到 48k、目录重扫、轨道缓存、`publish`/`fail` 槽位交接、**本地输出设备开合与 play/pause**（`Job::LocalSet` + `LOCAL_WANTED` 3s 滞回门控） | `JobResult` 原子量、`SoundRegistry`（Mutex<Vec> + version 计数）、mixer 槽位 LOADING 面、`LocalOut`（cpal Stream 属主） | ❌ 绝不调用 |
 | 宿主实时音频线程（process） | 混音 + tap ring 生产 | 槽位音频面（state/track 指针/pos/gain/loop/env）、静态 scratch、SPSC tap ring 写端 | ❌ 绝不调用，零分配零锁 |
 | cpal 输出回调线程 | 本地出声：tap ring 消费（宿主串流中）或槽位自渲染（宿主空闲，`HOST_MIX_FRAMES` 信标 150ms 门控） | tap ring 读端、槽位音频面（与宿主时间互斥）、回调私有重采样器/FIFO | ❌ 绝不调用 |
 
@@ -118,24 +118,14 @@ EMPTY ──reserve(总线)──► LOADING ──publish(worker, CAS)──►
 
 1. **会话对账**：Loading→(JOB_PUBLISHED)→Playing（推 `state` 给手机）；Loading 失败/超时（20 s）→ 摘除 + 记错；Playing 且槽位 EMPTY（自然播完）→ 摘除 + 推 `state`；Stopping 且槽位 EMPTY → 摘除 + reclaim
 2. **注册表版本**变化（worker 重扫发现文件增删）→ 推 `list` 给手机
-3. 每 tick：`LOCAL_WANTED` ←（localOutput ∧ 有会话）；每 8 tick（~2 s）：触发重扫 + 透出 local_error。**不再周期性重读配置**（旧实现每 2s 5 次 get_config = 5 次整文件读，全在实例锁内——见 §6.5）；热更新纯事件驱动：宿主在 UI/面板写配置后必发 `config:changed` → apply_config
-4. 有离散变化才 `push_state`（try_send，无 I/O）+ 更新内存面板快照（§6.5）
+3. 每 tick：`LOCAL_WANTED` ←（localOutput ∧ 有会话）；每 8 tick（~2 s）：apply_config 轻量重读（表单之外的 JSON 手改也能生效）+ 触发重扫 + 透出 local_error
+4. 有离散变化才 `push_state`（try_send）+ 直写 `sp_state`（去重，§6.5）
 
-### 6.5 延迟配置写入（防卡顿核心）
+### 6.5 面板状态写入（直写 + 去重；延迟落盘方案已回退）
 
-宿主 `get_config`/`set_config` **每次都整文件读/写 plugin-state.json**（manager.rs `load_persisted_state`/`save_state`，无内存缓存），而总线线程在 handle_message（含 interval:tick）期间**持有插件实例锁**，宿主音频线程每帧在同一把锁上**阻塞**（dsp.rs `run_node`）——锁内文件 I/O 直接等于音频卡顿（Windows Defender 实时扫描可把单次 I/O 放大到几十 ms）。改造：
+`sp_state`（面板轮询源）由总线线程在**离散变化时**直写 `set_config`（字符串去重，相同快照零写入）。
 
-| 旧路径（锁内 I/O） | 新路径 |
-|---|---|
-| 每次 play / 会话起止 → `set_config(sp_state)` 整文件读+写 | 只更新**内存快照**（Mutex<String> + 去重），入队待刷 |
-| 每 2s → `get_config` ×5 整文件读+解析 | **删除**；`config:changed` 事件驱动（宿主 UI 写入后必发） |
-| volume/vad 记忆即时 `set_config` | 入队（同键合并保最新） |
-
-实际落盘由**解码 worker** 房检查循环执行（≥500ms 节流；worker 不持实例锁，宿主回调自身线程安全——宿主 http_request 完成回调即从自生线程调用总线，先例成立；deinit 先 join worker 再 flush 残余并清 host 表，生命周期闭合）。sp_state 中会话进度按整秒取整（面板本来就显示 m:ss），快照字符串在真实变化之间保持稳定，去重后播放中最多 ~1 次写/秒、空闲 0 次。
-
-代价与权衡：worker 落盘与宿主 UI 写配置理论上存在整文件读-改-写竞态（宿主自身两个 UI 写入之间同样存在，非本插件引入）；500ms 节流窗口内面板最多晚半秒看到状态——面板轮询周期 700ms，不可感知。
-
-进度连续推进不靠推送：手机端本地插值 + 按需 `state` 轮询（PROTOCOL.md §sessions）。
+> **回退记录**：曾尝试"内存快照 + 解码 worker ≥500ms 节流落盘"以消除实例锁内的文件 I/O（卡顿归因 A 类）。实测：卡顿无改善，且面板刷新延迟恶化到 ~10s 量级——worker 房检查循环里落盘与**周期性目录重扫**（每个文件都要打开做容器探测）串行，库大时 flush 被重扫长期饿死。教训：跨线程延迟写把"面板可见性"耦合进了 worker 的忙闲，得不偿失；卡顿归因保留在案（§12 待查），写入路径回到最简直写。
 
 ## 7. 生命周期与双进程现实
 

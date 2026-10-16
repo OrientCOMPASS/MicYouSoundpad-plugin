@@ -403,7 +403,6 @@ fn worker_loop(
     let mut last_rescan = std::time::Instant::now()
         .checked_sub(Duration::from_secs(3600))
         .unwrap_or_else(std::time::Instant::now);
-    let mut last_flush = std::time::Instant::now();
     let mut cur_dir = sounds_dir;
     // Local headphone output (worker-owned: every device call happens here).
     let mut local: Option<crate::monitor::LocalOut> = None;
@@ -428,22 +427,6 @@ fn worker_loop(
                         .unwrap_or_else(|p| p.into_inner().clone());
                     let fresh = scan_sounds(&cur_dir, &labels);
                     registry.replace(fresh);
-                }
-                // 延迟配置落盘（sp_state / soundVolumes / vadGuard）：
-                // 真正的 set_config 文件写发生在这里——worker 线程不持插件
-                // 实例锁，文件 I/O 永不阻塞宿主音频线程（防卡顿核心）。
-                // 节流 ≥500ms；面板轮询周期 700ms，感知不到差异。
-                if last_flush.elapsed() >= Duration::from_millis(500) {
-                    let pending: Vec<(String, String)> = crate::CONFIG_QUEUE
-                        .lock()
-                        .map(|mut q| std::mem::take(&mut *q))
-                        .unwrap_or_default();
-                    if !pending.is_empty() {
-                        for (k, v) in &pending {
-                            crate::abi::set_config(k, v);
-                        }
-                        last_flush = std::time::Instant::now();
-                    }
                 }
                 // Local-output play/pause gate with 3 s idle hysteresis
                 // (avoid device churn between rapid pad presses). Host-monitor

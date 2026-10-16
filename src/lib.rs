@@ -118,6 +118,8 @@ struct State {
     /// VAD anti-collision guard (duck pad to 20% while speech is detected).
     vad_guard: bool,
     vad_threshold: f64,
+    /// Last `sp_state` JSON written to config (dedupe: write only on change).
+    last_panel_json: String,
     /// Registry version already pushed to the phone (list-change detection).
     pushed_registry_version: u64,
 }
@@ -141,6 +143,7 @@ impl State {
             volumes: std::collections::HashMap::new(),
             vad_guard: false,
             vad_threshold: 0.06,
+            last_panel_json: String::new(),
             pushed_registry_version: 0,
         }
     }
@@ -159,43 +162,6 @@ static HOST_MONITORING: std::sync::atomic::AtomicBool =
 static STATE: std::sync::LazyLock<Mutex<State>> =
     std::sync::LazyLock::new(|| Mutex::new(State::new()));
 static NEXT_REQ: AtomicU64 = AtomicU64::new(1);
-
-// ── 延迟配置写入（防卡顿核心）────────────────────────────────────────────
-// 宿主的 set_config/get_config 每次都整文件读写 plugin-state.json，而总线
-// 线程（handle_message/watchdog tick）持有插件实例锁——宿主音频线程每帧
-// 阻塞在同一把锁上（dsp.rs run_node）。因此：
-//   * 权威状态全部驻留内存（PANEL_JSON / State）；
-//   * 总线线程只入队 (key, json)（微秒级，纯内存）；
-//   * 真正落盘由解码 worker 的房检查循环节流执行（≥500ms，不持实例锁，
-//     文件 I/O 永不阻塞音频线程）；
-//   * init/deinit（宿主保证无并发 process）允许直接写。
-// 周期性的 apply_config 全量重读同样被移除：配置热更新只由 config:changed
-// 事件与 ui:apply 驱动（宿主在 UI 写入配置后必发该事件）。
-pub(crate) static CONFIG_QUEUE: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
-static PANEL_JSON: Mutex<String> = Mutex::new(String::new());
-
-/// 入队一个配置写入（总线线程；去重 sp_state 由调用侧的字符串比较完成）。
-pub(crate) fn queue_config(key: &str, json: String) {
-    if let Ok(mut q) = CONFIG_QUEUE.lock() {
-        // 同键合并：只保留最新值
-        if let Some(slot) = q.iter_mut().find(|(k, _)| k == key) {
-            slot.1 = json;
-        } else {
-            q.push((key.to_string(), json));
-        }
-    }
-}
-
-/// 立即清空队列（init/deinit 专用——这两个上下文允许文件 I/O）。
-fn flush_config_now() {
-    let pending: Vec<(String, String)> = CONFIG_QUEUE
-        .lock()
-        .map(|mut q| std::mem::take(&mut *q))
-        .unwrap_or_default();
-    for (k, v) in pending {
-        abi::set_config(&k, &v);
-    }
-}
 
 fn state() -> MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(|p| p.into_inner())
@@ -312,9 +278,7 @@ pub unsafe extern "C" fn micyou_plugin_init(host: *const mpl_host_api_t) -> abi:
             .as_ref()
             .map(|w| w.registry.list().len())
             .unwrap_or(0);
-        write_panel_state(&s);
-        // init 允许文件 I/O：首帧面板状态直接落盘
-        flush_config_now();
+        write_panel_state(&mut s);
         abi::log_info(&format!(
             "Soundpad v{PLUGIN_VERSION_STR} ready — {n} sound(s) in {}",
             s.sounds_dir.display()
@@ -350,10 +314,7 @@ pub extern "C" fn micyou_plugin_deinit() {
         HOST_MONITORING.store(false, std::sync::atomic::Ordering::Relaxed);
         monitor::set_suppressed(false);
         *s = State::new();
-        write_panel_state(&s);
         drop(s);
-        // worker 已 join：剩余队列（含最终空状态快照）直接落盘后再清 host 表
-        flush_config_now();
         abi::clear_host();
         sptrace!("deinit leave");
         abi::mpl_result_t::MPL_OK
@@ -420,6 +381,17 @@ pub unsafe extern "C" fn micyou_plugin_handle_event(
             "device_disconnected" => {
                 let mut s = state();
                 s.peer = None;
+                // 手机是音效板的主控端：连接断开即停止全部播放（10ms 淡出，
+                // 槽位由 watchdog 回收）。面板本地播放无设备事件，不受影响。
+                if !s.sessions.is_empty() {
+                    let n = s.sessions.len();
+                    stop_all(&mut s);
+                    update_wanted(&s);
+                    write_panel_state(&mut s);
+                    abi::log_info(&format!(
+                        "device disconnected — stopped {n} playing sound(s)"
+                    ));
+                }
             }
             "monitoring_changed" => {
                 // Payload shapes: {"enabled":b} or the serde enum wrapper
@@ -430,9 +402,9 @@ pub unsafe extern "C" fn micyou_plugin_handle_event(
                         // Instant path: the cpal callback checks this every
                         // ~10 ms and mutes while the host chain renders.
                         monitor::set_suppressed(on);
-                        let s = state();
+                        let mut s = state();
                         update_wanted(&s);
-                        write_panel_state(&s);
+                        write_panel_state(&mut s);
                         sptrace!("monitoring_changed → {on}");
                     }
                 }
@@ -594,7 +566,7 @@ fn handle_cmd(s: &mut State, source: &str, body: &[u8]) {
         Cmd::Vad { req, enable } => {
             s.vad_guard = enable;
             mixer::set_vad_guard(enable);
-            queue_config("vadGuard", (enable).to_string());
+            abi::set_config("vadGuard", if enable { "true" } else { "false" });
             abi::log_info(&format!(
                 "anti-collision guard {} (by {source})",
                 if enable { "enabled" } else { "disabled" }
@@ -819,11 +791,10 @@ fn watchdog(s: &mut State) {
     //    hysteresis). Auto-suppressed while the host ear-return is on.
     update_wanted(s);
 
-    // 4) Periodic housekeeping (~every 2 s): rescan pacing + worker error
-    //    surfacing. NO config re-read here — hot reload is event-driven
-    //    (`config:changed` / `ui:apply`); polling get_config would put file
-    //    reads back onto the instance-lock path (the stutter source).
+    // 4) Periodic housekeeping (~every 2 s): cheap config re-read (settings
+    //    edited outside the UI also land without re-enabling) + rescan pacing.
     if s.ticks % 8 == 0 {
+        apply_config(s);
         request_rescan(s);
         let lerr = s
             .worker
@@ -873,10 +844,10 @@ fn update_wanted(s: &State) {
     monitor::set_wanted(s.local_output && !s.sessions.is_empty());
 }
 
-/// Persist the per-sound volume memory (queued; worker writes it off-lock).
+/// Persist the per-sound volume memory (discrete user actions only).
 fn persist_volumes(s: &State) {
     if let Ok(json) = serde_json::to_string(&s.volumes) {
-        queue_config("soundVolumes", json);
+        abi::set_config("soundVolumes", &json);
     }
 }
 
@@ -975,12 +946,11 @@ fn session_to_json_with(r: &SessionRecord, pos_ms: u64, duration_ms: u64) -> ser
     )
 }
 
-/// Update the in-memory panel snapshot (`sp_state`) and queue a throttled
-/// flush (the worker performs the actual `set_config` file write off the
-/// instance lock). Session positions are rounded to whole seconds — the
-/// panel renders m:ss anyway, and it keeps the snapshot string stable
-/// between real changes so the dedupe below skips most flushes.
-fn write_panel_state(s: &State) {
+/// Persist the machine-readable status snapshot the desktop panel polls
+/// (`get_config` → `sp_state`). One `set_config` call per state CHANGE (not
+/// per tick) keeps host-side file I/O low; the string dedupe below skips
+/// no-op writes entirely.
+fn write_panel_state(s: &mut State) {
     let sounds: Vec<serde_json::Value> = s
         .worker
         .as_ref()
@@ -992,21 +962,8 @@ fn write_panel_state(s: &State) {
                 .collect()
         })
         .unwrap_or_default();
-    let sessions: Vec<serde_json::Value> = s
-        .sessions
-        .iter()
-        .map(|r| {
-            let mut v = session_snapshot_json(r);
-            if let Some(obj) = v.as_object_mut() {
-                if let Some(p) = obj.get("positionMs").and_then(|p| p.as_u64()) {
-                    obj.insert("positionMs".into(), serde_json::json!((p / 1000) * 1000));
-                }
-            }
-            v
-        })
-        .collect();
     let st = serde_json::json!({
-        "sessions": sessions,
+        "sessions": sessions_json(s),
         "sounds": sounds,
         "lastError": s.last_error,
         "masterVolume": s.master_volume,
@@ -1020,17 +977,9 @@ fn write_panel_state(s: &State) {
         "vadThreshold": s.vad_threshold,
     });
     let text = st.to_string();
-    let changed = {
-        let mut slot = PANEL_JSON.lock().unwrap_or_else(|p| p.into_inner());
-        if *slot != text {
-            *slot = text.clone();
-            true
-        } else {
-            false
-        }
-    };
-    if changed {
-        queue_config("sp_state", text);
+    if text != s.last_panel_json {
+        s.last_panel_json = text.clone();
+        abi::set_config("sp_state", &text);
     }
 }
 
