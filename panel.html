@@ -127,6 +127,14 @@
       <input type="range" id="localVol" min="0" max="2" step="0.05" value="1" style="max-width:160px" />
       <span class="val" id="localVolVal">100%</span>
     </div>
+    <div class="row switch">
+      <input type="checkbox" id="vadChk" />
+      <label for="vadChk" id="vadLabel" style="min-width:0"></label>
+      <span style="flex:1"></span>
+      <label id="vadThrLabel" style="min-width:0"></label>
+      <input type="range" id="vadThr" min="0" max="0.5" step="0.005" value="0.06" style="max-width:140px" />
+      <span class="val" id="vadThrVal">0.060</span>
+    </div>
     <div class="row">
       <label id="dirLabel"></label>
       <input type="text" id="dirInput" placeholder="" />
@@ -162,6 +170,8 @@ const T = {
     peer: '手机已连接', errPrefix: '错误：',
     loading: '解码中…', monitorOn: '宿主监听中 · 耳机输出已自动暂停',
     local: '播放到耳机（无需打开监听）', localVol: '耳机音量',
+    vad: '防撞（说话时音效压低到 20%）', vadThr: '阈值',
+    monitorOn2: '宿主监听中 · 耳机输出已即时让位',
     dirLabel: '自定义目录', dirApply: '应用',
     dirPlaceholder: '留空 = 插件目录/sounds（绝对路径）',
     dirHint: '当前目录：', localErrPrefix: '耳机输出不可用：',
@@ -176,6 +186,8 @@ const T = {
     peer: 'phone connected', errPrefix: 'Error: ',
     loading: 'decoding\u2026', monitorOn: 'host monitor on \u00b7 local output auto-paused',
     local: 'Play to headphones (no monitor needed)', localVol: 'Local volume',
+    vad: 'Anti-collision (duck sounds to 20% while you speak)', vadThr: 'Threshold',
+    monitorOn2: 'host monitor on \u00b7 local output yields instantly',
     dirLabel: 'Custom folder', dirApply: 'Apply',
     dirPlaceholder: 'empty = <plugin dir>/sounds (absolute path)',
     dirHint: 'Current folder: ', localErrPrefix: 'Headphone output unavailable: ',
@@ -232,7 +244,7 @@ function render(cfg) {
 
   const mon = !!st.monitorOn && st.localOutput !== false;
   $('monitorBadge').style.display = mon ? 'inline-block' : 'none';
-  $('monitorBadge').textContent = '🎧 ' + t.monitorOn;
+  $('monitorBadge').textContent = '🎧 ' + t.monitorOn2;
 
   // ── sound grid ──
   $('padGrid').innerHTML = '';
@@ -261,6 +273,11 @@ function render(cfg) {
   $('masterVal').textContent = Math.round(lastMaster * 100) + '%';
 
   if (typeof st.localOutput === 'boolean') $('localChk').checked = st.localOutput;
+  if (typeof st.vadGuard === 'boolean') $('vadChk').checked = st.vadGuard;
+  if (typeof st.vadThreshold === 'number' && !$('vadThr').matches(':active')) {
+    $('vadThr').value = st.vadThreshold;
+  }
+  $('vadThrVal').textContent = Number($('vadThr').value).toFixed(3);
   if (typeof st.localVolume === 'number' && Math.abs(st.localVolume - lastLocalVol) > 1e-6 && !$('localVol').matches(':active')) {
     $('localVol').value = st.localVolume;
   }
@@ -290,6 +307,8 @@ function applyTexts() {
   $('masterLabel').textContent = t.master;
   $('localLabel').textContent = t.local;
   $('localVolLabel').textContent = t.localVol;
+  $('vadLabel').textContent = t.vad;
+  $('vadThrLabel').textContent = t.vadThr;
   $('dirLabel').textContent = t.dirLabel;
   $('dirApply').textContent = t.dirApply;
   $('dirInput').placeholder = t.dirPlaceholder;
@@ -333,6 +352,22 @@ $('localChk').addEventListener('change', async () => {
     await call('trigger', { action: 'apply' });
   } catch (e) { console.warn(e); }
   setTimeout(refresh, 300);
+});
+$('vadChk').addEventListener('change', async () => {
+  try {
+    await call('set_config', { key: 'vadGuard', value: $('vadChk').checked });
+    await call('trigger', { action: 'apply' });
+  } catch (e) { console.warn(e); }
+  setTimeout(refresh, 300);
+});
+$('vadThr').addEventListener('input', () => {
+  $('vadThrVal').textContent = Number($('vadThr').value).toFixed(3);
+});
+$('vadThr').addEventListener('change', async () => {
+  try {
+    await call('set_config', { key: 'vadThreshold', value: Number($('vadThr').value) });
+    await call('trigger', { action: 'apply' });
+  } catch (e) { console.warn(e); }
 });
 $('dirApply').addEventListener('click', async () => {
   const v = $('dirInput').value.trim();

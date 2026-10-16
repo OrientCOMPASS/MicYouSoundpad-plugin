@@ -13,6 +13,8 @@ MicYou 原生插件 `opss.soundpad` 的实现说明：需求分解、宿主机�
 | 混入麦克风流 | 注册为 DSP 节点（`kind: dsp`，`insertAfter: VAD`，`realtimeSafe: true`），在 `micyou_plugin_process` 中做加性混音。**不用**宿主 `play_sound`：它排队播整只 WAV，无进度/音量/循环/多声部控制 |
 | 本地出声（不开监听） | 自带 cpal 输出流（monitor.rs）：串流中消费实时线程的 tap ring，宿主空闲时自渲染（§5.5）；**宿主监听开启时自动抑制**（v2 API `get_monitoring` + `monitoring_changed` 事件，见 §5.5） |
 | 按音效记忆音量 | `soundVolumes` 配置（id → 音量）：`volume` 命令与显式 `play` 音量写入；`play` 缺省音量时读取 |
+| 防撞（说话时音效让位） | 实时线程内逐帧 RMS VAD（处理链内信号，音效不会自触发）+ 0.2 ducking 包络，复刻旧版 MicYouSoundpad 客户端算法（§5.6） |
+| 面板状态不落总线 I/O | sp_state 权威副本驻留内存，worker 节流落盘（§6.5） |
 | 文件夹分类 | 递归扫描（深度 ≤8 / ≤4096 文件 / 跳过隐藏项），id = 相对路径；协议 `sounds[].dir` 供手机端导航 |
 | 音效目录自定义 | `soundsDir` 配置热生效：总线线程只做比对，目录重扫在 worker（Job 携带新路径） |
 | 手机发现插件 | 手机经跨设备 `PluginMessage` 发 `hello`；插件回包（含音效列表）即"确定有 soundpad 插件" |
@@ -39,7 +41,7 @@ MicYou 原生插件 `opss.soundpad` 的实现说明：需求分解、宿主机�
 | 线程 | 职责 | 触碰的资源 | Host API |
 |---|---|---|---|
 | 宿主总线线程（init / deinit / handle_message / handle_event / interval tick） | 会话注册表、命令解析、回包、watchdog 对账、面板状态写入 | `STATE` 互斥锁、mixer 槽位控制面（reserve/stop/seek/gain/reclaim）、mpsc 发任务 | ✅ 仅此处（init/deinit 允许文件 I/O；消息处理路径零文件 I/O） |
-| 解码 worker（`soundpad-decode`，单线程） | 音频解码（WAV/symphonia 多格式）、重采样到 48k、目录重扫、轨道缓存、`publish`/`fail` 槽位交接、**本地输出设备开合与 play/pause**（`Job::LocalSet` + `LOCAL_WANTED` 3s 滞回门控） | `JobResult` 原子量、`SoundRegistry`（Mutex<Vec> + version 计数）、mixer 槽位 LOADING 面、`LocalOut`（cpal Stream 属主） | ❌ 绝不调用 |
+| 解码 worker（`soundpad-decode`，单线程） | 音频解码（WAV/symphonia 多格式）、重采样到 48k、目录重扫、轨道缓存、`publish`/`fail` 槽位交接、**本地输出设备开合与 play/pause**（`Job::LocalSet` + `LOCAL_WANTED` 3s 滞回门控）、**延迟配置落盘**（§6.5，唯一允许 worker 调 Host API 的窄例外，见 abi.rs 注释） | `JobResult` 原子量、`SoundRegistry`（Mutex<Vec> + version 计数）、mixer 槽位 LOADING 面、`LocalOut`（cpal Stream 属主） | ❌ 绝不调用 |
 | 宿主实时音频线程（process） | 混音 + tap ring 生产 | 槽位音频面（state/track 指针/pos/gain/loop/env）、静态 scratch、SPSC tap ring 写端 | ❌ 绝不调用，零分配零锁 |
 | cpal 输出回调线程 | 本地出声：tap ring 消费（宿主串流中）或槽位自渲染（宿主空闲，`HOST_MIX_FRAMES` 信标 150ms 门控） | tap ring 读端、槽位音频面（与宿主时间互斥）、回调私有重采样器/FIFO | ❌ 绝不调用 |
 
@@ -94,9 +96,21 @@ EMPTY ──reserve(总线)──► LOADING ──publish(worker, CAS)──►
 | 设备 I/O 不能在总线线程（实例锁 → 爆音） | Stream 的 open/play/pause/drop 全部由解码 worker 执行：init 经 `Job::LocalSet(true)` 开启（初始 paused）；watchdog 写 `LOCAL_WANTED`（有会话 && localOutput），worker 200ms 房检查带 3s 空闲滞回 play/pause；deinit join worker 时 Drop 关设备 |
 | 无输出设备/打开失败 | worker 写入 `local_error`，watchdog 透出到 `sp_state.localError`（面板显示"耳机输出不可用"），插件其余功能不受影响 |
 
-**宿主监听联动**：宿主耳返开启时处理链（含 pad 混音）已被宿主路由到耳机，本插件再出声即双重播放。init 经 `host_info().apiVersion` 探测 v2（append-only ABI：v1 宿主表可能止于 `set_panel_icon`，越读即 OOB，故 v2 字段全部 `Option<fn>` 且仅在探测通过后触碰）；`get_monitoring()` 取初值 + `monitoring_changed` 事件跟随（需 `control.observe` 能力）；抑制点收敛在 `LOCAL_WANTED` 门（`localOutput ∧ ¬hostMonitoring ∧ 有会话`），worker 滞回逻辑无需感知原因。v1 宿主 → 状态未知 → 不抑制（保持旧行为）。
+**宿主监听联动**：宿主耳返开启时处理链（含 pad 混音）已被宿主路由到耳机，本插件再出声即双重播放。init 经 `host_info().apiVersion` 探测 v2（append-only ABI：v1 宿主表可能止于 `set_panel_icon`，越读即 OOB，故 v2 字段全部 `Option<fn>` 且仅在探测通过后触碰）；`get_monitoring()` 取初值 + `monitoring_changed` 事件跟随（需 `control.observe` 能力）。v1 宿主 → 状态未知 → 不抑制（保持旧行为）。
+
+**抑制的即时性（2~3s 拖尾的根因与修复）**：最初把抑制并入 `LOCAL_WANTED` 门 → 由 worker 房检查（≤200ms）+ **3s 空闲滞回**执行暂停——滞回是为"会话间隙避免设备开合抖动"设计的，误用在监听抑制上就产生了"监听打开后耳机还响 2~3 秒"。修复分两层：① **cpal 回调内**每帧检查 `SUPPRESSED ∧ host_active` → 直接输出静音并清 ring/FIFO（生效 ≤1 个回调周期 ≈10ms）；② 流本身不暂停（`LOCAL_WANTED` 回到"有会话即播"语义）。抑制仅在**宿主链确实在渲染**（信标活跃）时生效：宿主空闲时监听本来无声，本地试听（自渲染）必须保留，否则离线预览会被冻结。
 
 包络 `env` 因双渲染者改为 `AtomicU32`（f32 bits，每次调用一读一写，非逐样本原子）——门控保证事实单写者，原子性消除理论数据竞争。
+
+## 5.6 防撞（VAD Ducking）
+
+复刻旧版 MicYouSoundpad 客户端的"类 VAD 防撞 Ducking"：
+
+- **检测源的选择**：不用 `audio_state()` 轮询（250ms 级延迟 + Host API 调用），而是利用插件在 DSP 链中的位置——节点收到的 `data` 是 **AEC/VAD 之后、pad 加入之前**的麦克风信号，在 `process_slice` 内逐帧算归一化 RMS（步长 2，~240 MAC/帧）：零延迟、零 Host API、**音效永不触发自己**（pad 在本节点才混入）
+- **判定**：`rms ≥ vadThreshold`（默认 0.06 = 旧版灵敏度 50 的等效值）→ 说话；低于阈值后 30 帧（~300ms）挂起，防音节间隙泵机
+- **动作**：duck 包络（attack 0.15/帧、release 0.02/帧、目标 0.2）乘在 scratch 混音上——**tap（耳机）与麦克风路同时被 duck**，麦克风直通信号不受影响；不拦截播放请求（与旧版一致）
+- **状态归属**：包络与挂起计数为宿主音频线程独占（UnsafeCell）；开关/阈值是原子量（总线写）。本地自渲染路径（宿主空闲）恒不 duck——没有流就没有麦克风，无从"相撞"
+- **已知边界**：外放场景下 pad 声音经声学路径漏回麦克风（cpal 直出不在宿主 AEC 参考内）可能自激触发 duck——耳机场景无此问题（README 已注明）
 
 ## 6. watchdog 与状态推送
 
@@ -104,8 +118,22 @@ EMPTY ──reserve(总线)──► LOADING ──publish(worker, CAS)──►
 
 1. **会话对账**：Loading→(JOB_PUBLISHED)→Playing（推 `state` 给手机）；Loading 失败/超时（20 s）→ 摘除 + 记错；Playing 且槽位 EMPTY（自然播完）→ 摘除 + 推 `state`；Stopping 且槽位 EMPTY → 摘除 + reclaim
 2. **注册表版本**变化（worker 重扫发现文件增删）→ 推 `list` 给手机
-3. 每 tick：`LOCAL_WANTED` ←（localOutput && 有会话）；每 8 tick（~2 s）：完整 apply_config 重读（masterVolume/localVolume/localOutput/soundsDir，JSON 编辑器改的也能生效；变化才动作）+ 透出 local_error + 触发重扫
-4. 有离散变化才 `push_state` + 写 `sp_state` 配置（面板轮询源；**按变化写**而非按 tick 写，控制宿主 I/O）
+3. 每 tick：`LOCAL_WANTED` ←（localOutput ∧ 有会话）；每 8 tick（~2 s）：触发重扫 + 透出 local_error。**不再周期性重读配置**（旧实现每 2s 5 次 get_config = 5 次整文件读，全在实例锁内——见 §6.5）；热更新纯事件驱动：宿主在 UI/面板写配置后必发 `config:changed` → apply_config
+4. 有离散变化才 `push_state`（try_send，无 I/O）+ 更新内存面板快照（§6.5）
+
+### 6.5 延迟配置写入（防卡顿核心）
+
+宿主 `get_config`/`set_config` **每次都整文件读/写 plugin-state.json**（manager.rs `load_persisted_state`/`save_state`，无内存缓存），而总线线程在 handle_message（含 interval:tick）期间**持有插件实例锁**，宿主音频线程每帧在同一把锁上**阻塞**（dsp.rs `run_node`）——锁内文件 I/O 直接等于音频卡顿（Windows Defender 实时扫描可把单次 I/O 放大到几十 ms）。改造：
+
+| 旧路径（锁内 I/O） | 新路径 |
+|---|---|
+| 每次 play / 会话起止 → `set_config(sp_state)` 整文件读+写 | 只更新**内存快照**（Mutex<String> + 去重），入队待刷 |
+| 每 2s → `get_config` ×5 整文件读+解析 | **删除**；`config:changed` 事件驱动（宿主 UI 写入后必发） |
+| volume/vad 记忆即时 `set_config` | 入队（同键合并保最新） |
+
+实际落盘由**解码 worker** 房检查循环执行（≥500ms 节流；worker 不持实例锁，宿主回调自身线程安全——宿主 http_request 完成回调即从自生线程调用总线，先例成立；deinit 先 join worker 再 flush 残余并清 host 表，生命周期闭合）。sp_state 中会话进度按整秒取整（面板本来就显示 m:ss），快照字符串在真实变化之间保持稳定，去重后播放中最多 ~1 次写/秒、空闲 0 次。
+
+代价与权衡：worker 落盘与宿主 UI 写配置理论上存在整文件读-改-写竞态（宿主自身两个 UI 写入之间同样存在，非本插件引入）；500ms 节流窗口内面板最多晚半秒看到状态——面板轮询周期 700ms，不可感知。
 
 进度连续推进不靠推送：手机端本地插值 + 按需 `state` 轮询（PROTOCOL.md §sessions）。
 
@@ -125,7 +153,7 @@ EMPTY ──reserve(总线)──► LOADING ──publish(worker, CAS)──►
 
 ## 9. 测试
 
-`cargo test --release`（43 用例，CI 每平台跑）：
+`cargo test --release`（46 用例，CI 每平台跑）：
 
 - **mixer**：空闲 bypass、发布/自然结束/淡出回收、循环回绕、seek 夹取、会话音量与主音量、单声道↔立体声映射、取消竞态、双声部加性（峰值 2×）、槽位满员。共享静态槽位表 → 全部用例经测试锁串行 + 每用例前 `reclaim_all` 清场（防失败级联）
 - **wav**：PCM16 编解码往返、立体声交错、float32/PCM24、LIST 填充块跳读、非 WAV 拒绝、演示音生成
@@ -136,6 +164,7 @@ EMPTY ──reserve(总线)──► LOADING ──publish(worker, CAS)──►
 - **ring**：SPSC 往返/环绕/满环丢弃/backlog 钳制/立体声上混（承自 Focus-Capture）
 - **monitor**：本地增益缩放与静音、i16 转换夹取、LOCAL_WANTED 往返
 - **mixer 本地路**：`render_local_mono` 推进位置且不喂宿主信标（门控正确性的单元证据）
+- **防撞**：响输入 → duck 收敛至 ~0.2（残差峰值比校验）；静输入 → 不 duck
 
 音频线程行为无法在单测中真并发复现，采用"直接驱动 `process_slice`"模型测试（单线程即音频线程语义）；跨平台产物由 CI 矩阵构建把关（windows/linux/macos×2 四目标 + lipo universal）。
 

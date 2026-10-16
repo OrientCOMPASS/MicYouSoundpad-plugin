@@ -139,7 +139,16 @@ pub fn clear_host() {
 
 /// Run `f` with the stored host table. Returns `None` before `init` / after
 /// `deinit`, or when the (poisoned) lock is unavailable. Never call this from
-/// the real-time audio thread or from the decode worker thread.
+/// the real-time audio thread.
+///
+/// Decode-worker exception (deliberate, narrow): the worker's housekeeping
+/// loop flushes queued `set_config` writes here. Rationale — the bus thread
+/// holds the plugin-instance lock while the host audio thread *blocks* on it
+/// every frame (dsp.rs run_node), so any file I/O on the bus thread is an
+/// audio glitch; the worker holds no plugin lock, the host callbacks are
+/// internally synchronized (the host itself calls them from spawned threads,
+/// e.g. http_request completion), and `deinit` joins the worker BEFORE
+/// `clear_host`, so the table is valid for every worker call.
 pub fn with_host<R>(f: impl FnOnce(&mpl_host_api_t) -> R) -> Option<R> {
     HOST.lock()
         .ok()
@@ -194,6 +203,7 @@ pub fn get_config(key: &str) -> String {
 }
 
 /// `set_config(key, json_value)` — `json_value` must be valid JSON text.
+/// Callable from bus/init/deinit AND the decode worker (see `with_host`).
 pub fn set_config(key: &str, json_value: &str) -> bool {
     crate::sptrace!("host set_config: {key}");
     with_host(|h| {

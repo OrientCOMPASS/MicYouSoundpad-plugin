@@ -115,8 +115,9 @@ struct State {
     /// Per-sound volume memory (sound id → 0..2), persisted in the
     /// `soundVolumes` config key. A play without an explicit volume uses it.
     volumes: std::collections::HashMap<String, f64>,
-    /// Last `sp_state` JSON written to config (dedupe: write only on change).
-    last_panel_json: String,
+    /// VAD anti-collision guard (duck pad to 20% while speech is detected).
+    vad_guard: bool,
+    vad_threshold: f64,
     /// Registry version already pushed to the phone (list-change detection).
     pushed_registry_version: u64,
 }
@@ -138,7 +139,8 @@ impl State {
             local_volume: 1.0,
             local_error: String::new(),
             volumes: std::collections::HashMap::new(),
-            last_panel_json: String::new(),
+            vad_guard: false,
+            vad_threshold: 0.06,
             pushed_registry_version: 0,
         }
     }
@@ -157,6 +159,43 @@ static HOST_MONITORING: std::sync::atomic::AtomicBool =
 static STATE: std::sync::LazyLock<Mutex<State>> =
     std::sync::LazyLock::new(|| Mutex::new(State::new()));
 static NEXT_REQ: AtomicU64 = AtomicU64::new(1);
+
+// ── 延迟配置写入（防卡顿核心）────────────────────────────────────────────
+// 宿主的 set_config/get_config 每次都整文件读写 plugin-state.json，而总线
+// 线程（handle_message/watchdog tick）持有插件实例锁——宿主音频线程每帧
+// 阻塞在同一把锁上（dsp.rs run_node）。因此：
+//   * 权威状态全部驻留内存（PANEL_JSON / State）；
+//   * 总线线程只入队 (key, json)（微秒级，纯内存）；
+//   * 真正落盘由解码 worker 的房检查循环节流执行（≥500ms，不持实例锁，
+//     文件 I/O 永不阻塞音频线程）；
+//   * init/deinit（宿主保证无并发 process）允许直接写。
+// 周期性的 apply_config 全量重读同样被移除：配置热更新只由 config:changed
+// 事件与 ui:apply 驱动（宿主在 UI 写入配置后必发该事件）。
+pub(crate) static CONFIG_QUEUE: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+static PANEL_JSON: Mutex<String> = Mutex::new(String::new());
+
+/// 入队一个配置写入（总线线程；去重 sp_state 由调用侧的字符串比较完成）。
+pub(crate) fn queue_config(key: &str, json: String) {
+    if let Ok(mut q) = CONFIG_QUEUE.lock() {
+        // 同键合并：只保留最新值
+        if let Some(slot) = q.iter_mut().find(|(k, _)| k == key) {
+            slot.1 = json;
+        } else {
+            q.push((key.to_string(), json));
+        }
+    }
+}
+
+/// 立即清空队列（init/deinit 专用——这两个上下文允许文件 I/O）。
+fn flush_config_now() {
+    let pending: Vec<(String, String)> = CONFIG_QUEUE
+        .lock()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default();
+    for (k, v) in pending {
+        abi::set_config(&k, &v);
+    }
+}
 
 fn state() -> MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(|p| p.into_inner())
@@ -221,10 +260,9 @@ pub unsafe extern "C" fn micyou_plugin_init(host: *const mpl_host_api_t) -> abi:
         // Host API v2? Enables monitoring-state observation (auto-suppress
         // local output while the host ear-return already plays the pad).
         let v2 = abi::detect_v2();
-        HOST_MONITORING.store(
-            abi::get_monitoring().unwrap_or(false),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let mon0 = abi::get_monitoring().unwrap_or(false);
+        HOST_MONITORING.store(mon0, std::sync::atomic::Ordering::Relaxed);
+        monitor::set_suppressed(mon0);
         sptrace!("init: host api v2={v2} monitoring={}", HOST_MONITORING.load(std::sync::atomic::Ordering::Relaxed));
 
         // Config: master volume, local headphone output, label overrides.
@@ -233,6 +271,10 @@ pub unsafe extern "C" fn micyou_plugin_init(host: *const mpl_host_api_t) -> abi:
         s.local_output = config_bool("localOutput", true);
         s.local_volume = config_f64("localVolume", 1.0).clamp(0.0, 2.0);
         monitor::set_local_gain(s.local_volume);
+        s.vad_guard = config_bool("vadGuard", false);
+        s.vad_threshold = config_f64("vadThreshold", 0.06).clamp(0.0, 1.0);
+        mixer::set_vad_guard(s.vad_guard);
+        mixer::set_vad_threshold(s.vad_threshold as f32);
         s.volumes = serde_json::from_str(&abi::get_config("soundVolumes"))
             .unwrap_or_else(|_| serde_json::from_str::<serde_json::Value>("{}")
                 .ok()
@@ -270,7 +312,9 @@ pub unsafe extern "C" fn micyou_plugin_init(host: *const mpl_host_api_t) -> abi:
             .as_ref()
             .map(|w| w.registry.list().len())
             .unwrap_or(0);
-        write_panel_state(&mut s);
+        write_panel_state(&s);
+        // init 允许文件 I/O：首帧面板状态直接落盘
+        flush_config_now();
         abi::log_info(&format!(
             "Soundpad v{PLUGIN_VERSION_STR} ready — {n} sound(s) in {}",
             s.sounds_dir.display()
@@ -304,8 +348,12 @@ pub extern "C" fn micyou_plugin_deinit() {
         // chain, so force-reclaiming every slot's track is safe here.
         mixer::reclaim_all();
         HOST_MONITORING.store(false, std::sync::atomic::Ordering::Relaxed);
+        monitor::set_suppressed(false);
         *s = State::new();
+        write_panel_state(&s);
         drop(s);
+        // worker 已 join：剩余队列（含最终空状态快照）直接落盘后再清 host 表
+        flush_config_now();
         abi::clear_host();
         sptrace!("deinit leave");
         abi::mpl_result_t::MPL_OK
@@ -379,8 +427,12 @@ pub unsafe extern "C" fn micyou_plugin_handle_event(
                 if let Some(json) = unsafe { json_arg(_json) } {
                     if let Some(on) = parse_enabled(&json) {
                         HOST_MONITORING.store(on, std::sync::atomic::Ordering::Relaxed);
+                        // Instant path: the cpal callback checks this every
+                        // ~10 ms and mutes while the host chain renders.
+                        monitor::set_suppressed(on);
                         let s = state();
                         update_wanted(&s);
+                        write_panel_state(&s);
                         sptrace!("monitoring_changed → {on}");
                     }
                 }
@@ -486,7 +538,9 @@ fn handle_cmd(s: &mut State, source: &str, body: &[u8]) {
             request_rescan(s);
             send_to_peer(s, &protocol::list_reply(req, sounds_json(s)));
         }
-        Cmd::State { req } => send_to_peer(s, &protocol::state_reply(req, sessions_json(s))),
+        Cmd::State { req } => {
+            send_to_peer(s, &protocol::state_reply(req, sessions_json(s), s.vad_guard))
+        }
         Cmd::Play { req, id, volume, r#loop } => {
             start_play(s, source, req, &id, volume, r#loop, false);
         }
@@ -536,6 +590,18 @@ fn handle_cmd(s: &mut State, source: &str, body: &[u8]) {
             } else {
                 send_to_peer(s, &protocol::error_reply(req, &format!("unknown session {session_id}")));
             }
+        }
+        Cmd::Vad { req, enable } => {
+            s.vad_guard = enable;
+            mixer::set_vad_guard(enable);
+            queue_config("vadGuard", (enable).to_string());
+            abi::log_info(&format!(
+                "anti-collision guard {} (by {source})",
+                if enable { "enabled" } else { "disabled" }
+            ));
+            send_to_peer(s, &protocol::ok_reply(req, "vad"));
+            push_state(s, 0);
+            write_panel_state(s);
         }
         Cmd::Unknown { req, op } => {
             send_to_peer(s, &protocol::error_reply(req, &format!("unknown op {op:?}")));
@@ -753,10 +819,11 @@ fn watchdog(s: &mut State) {
     //    hysteresis). Auto-suppressed while the host ear-return is on.
     update_wanted(s);
 
-    // 4) Periodic housekeeping (~every 2 s): full config re-read (JSON-edited
-    //    changes also land without re-enabling) + rescan pacing.
+    // 4) Periodic housekeeping (~every 2 s): rescan pacing + worker error
+    //    surfacing. NO config re-read here — hot reload is event-driven
+    //    (`config:changed` / `ui:apply`); polling get_config would put file
+    //    reads back onto the instance-lock path (the stutter source).
     if s.ticks % 8 == 0 {
-        apply_config(s);
         request_rescan(s);
         let lerr = s
             .worker
@@ -798,16 +865,18 @@ fn parse_enabled(json: &str) -> Option<bool> {
         .find_map(|inner| inner.get("enabled").and_then(|x| x.as_bool()))
 }
 
-/// LOCAL_WANTED = user toggle ∧ no host ear-return ∧ live sessions.
+/// LOCAL_WANTED = user toggle ∧ live sessions. Host-monitor suppression is
+/// applied inside the cpal callback (instant silence while the host chain
+/// renders) — pausing the stream here instead would lag by the worker's
+/// housekeeping cycle and freeze the offline preview.
 fn update_wanted(s: &State) {
-    let monitoring = HOST_MONITORING.load(std::sync::atomic::Ordering::Relaxed);
-    monitor::set_wanted(s.local_output && !monitoring && !s.sessions.is_empty());
+    monitor::set_wanted(s.local_output && !s.sessions.is_empty());
 }
 
-/// Persist the per-sound volume memory (discrete user actions only).
+/// Persist the per-sound volume memory (queued; worker writes it off-lock).
 fn persist_volumes(s: &State) {
     if let Ok(json) = serde_json::to_string(&s.volumes) {
-        abi::set_config("soundVolumes", &json);
+        queue_config("soundVolumes", json);
     }
 }
 
@@ -848,12 +917,13 @@ fn push_hello(s: &State, req: u64) {
             PLUGIN_VERSION_STR,
             sounds_json(s),
             sessions_json(s),
+            s.vad_guard,
         ),
     );
 }
 
 fn push_state(s: &State, req: u64) {
-    send_to_peer(s, &protocol::state_reply(req, sessions_json(s)));
+    send_to_peer(s, &protocol::state_reply(req, sessions_json(s), s.vad_guard));
 }
 
 fn sounds_json(s: &State) -> Vec<serde_json::Value> {
@@ -905,9 +975,12 @@ fn session_to_json_with(r: &SessionRecord, pos_ms: u64, duration_ms: u64) -> ser
     )
 }
 
-/// Persist the machine-readable snapshot the desktop panel polls
-/// (`get_config` → `sp_state`). Written only when the content changed.
-fn write_panel_state(s: &mut State) {
+/// Update the in-memory panel snapshot (`sp_state`) and queue a throttled
+/// flush (the worker performs the actual `set_config` file write off the
+/// instance lock). Session positions are rounded to whole seconds — the
+/// panel renders m:ss anyway, and it keeps the snapshot string stable
+/// between real changes so the dedupe below skips most flushes.
+fn write_panel_state(s: &State) {
     let sounds: Vec<serde_json::Value> = s
         .worker
         .as_ref()
@@ -919,8 +992,21 @@ fn write_panel_state(s: &mut State) {
                 .collect()
         })
         .unwrap_or_default();
+    let sessions: Vec<serde_json::Value> = s
+        .sessions
+        .iter()
+        .map(|r| {
+            let mut v = session_snapshot_json(r);
+            if let Some(obj) = v.as_object_mut() {
+                if let Some(p) = obj.get("positionMs").and_then(|p| p.as_u64()) {
+                    obj.insert("positionMs".into(), serde_json::json!((p / 1000) * 1000));
+                }
+            }
+            v
+        })
+        .collect();
     let st = serde_json::json!({
-        "sessions": sessions_json(s),
+        "sessions": sessions,
         "sounds": sounds,
         "lastError": s.last_error,
         "masterVolume": s.master_volume,
@@ -930,11 +1016,21 @@ fn write_panel_state(s: &mut State) {
         "localVolume": s.local_volume,
         "localError": s.local_error,
         "monitorOn": HOST_MONITORING.load(std::sync::atomic::Ordering::Relaxed),
+        "vadGuard": s.vad_guard,
+        "vadThreshold": s.vad_threshold,
     });
     let text = st.to_string();
-    if text != s.last_panel_json {
-        s.last_panel_json = text.clone();
-        abi::set_config("sp_state", &text);
+    let changed = {
+        let mut slot = PANEL_JSON.lock().unwrap_or_else(|p| p.into_inner());
+        if *slot != text {
+            *slot = text.clone();
+            true
+        } else {
+            false
+        }
+    };
+    if changed {
+        queue_config("sp_state", text);
     }
 }
 
@@ -994,6 +1090,19 @@ fn apply_config(s: &mut State) {
         s.local_volume = lv;
         monitor::set_local_gain(lv);
     }
+    let mut peer_sync = false;
+    let vg = config_bool("vadGuard", false);
+    if vg != s.vad_guard {
+        s.vad_guard = vg;
+        mixer::set_vad_guard(vg);
+        peer_sync = true; // 手机端开关随 state 推送保持同步
+        abi::log_info(&format!("anti-collision guard {}", if vg { "enabled" } else { "disabled" }));
+    }
+    let vt = config_f64("vadThreshold", 0.06).clamp(0.0, 1.0);
+    if (vt - s.vad_threshold).abs() > 1e-9 {
+        s.vad_threshold = vt;
+        mixer::set_vad_threshold(vt as f32);
+    }
     let lo = config_bool("localOutput", true);
     if lo != s.local_output {
         s.local_output = lo;
@@ -1030,6 +1139,9 @@ fn apply_config(s: &mut State) {
     if let Some(w) = s.worker.as_ref() {
         w.set_labels(label_map_from_config());
         w.request_rescan();
+    }
+    if peer_sync {
+        push_state(s, 0);
     }
     write_panel_state(s);
 }

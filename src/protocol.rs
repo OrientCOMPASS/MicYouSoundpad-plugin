@@ -19,6 +19,8 @@
 //! * `seek`     — `{sessionId, positionMs}`
 //! * `volume`   — `{sessionId, volume}` (0.0 – 2.0)
 //! * `loop`     — `{sessionId, loop}`
+//! * `vad`      — `{enable}` toggle the anti-collision guard (duck the pad
+//!   to 20% while the mic carries speech; persisted as `vadGuard` config)
 //! * `state`    — request the live session snapshot
 //!
 //! Desktop → phone (`op`):
@@ -26,7 +28,8 @@
 //!   device connect; this is what makes the phone show the Soundpad button)
 //! * `list`     — `{sounds[]}`
 //! * `play`     — `{sessionId, session}` immediate ack (phase `loading`)
-//! * `state`    — `{sessions[]}` snapshot (reply or push on any change)
+//! * `state`    — `{sessions[], vadGuard}` snapshot (reply or push on any
+//!   change)
 //! * `error`    — `{message}` with the echoed `req`
 //!
 //! `sounds[]` entry: `{id, label, durationMs}` ·
@@ -49,6 +52,8 @@ pub enum Cmd {
     Seek { req: u64, session_id: u64, position_ms: u64 },
     Volume { req: u64, session_id: u64, volume: f64 },
     Loop { req: u64, session_id: u64, r#loop: bool },
+    /// Enable/disable the VAD anti-collision guard (ducking).
+    Vad { req: u64, enable: bool },
     Unknown { req: u64, op: String },
 }
 
@@ -116,6 +121,13 @@ pub fn parse_cmd(payload: &[u8]) -> Result<Cmd, String> {
                 .and_then(Value::as_bool)
                 .ok_or("loop: missing loop")?;
             Ok(Cmd::Loop { req, session_id: sid, r#loop: lo })
+        }
+        "vad" => {
+            let enable = obj
+                .get("enable")
+                .and_then(Value::as_bool)
+                .ok_or("vad: missing enable")?;
+            Ok(Cmd::Vad { req, enable })
         }
         _ => Ok(Cmd::Unknown { req, op }),
     }
@@ -187,10 +199,11 @@ pub fn hello_reply(
     version: &str,
     sounds: Vec<Value>,
     sessions: Vec<Value>,
+    vad_guard: bool,
 ) -> Value {
     json!({
         "op": "hello", "req": req, "plugin": plugin_id, "version": version,
-        "sounds": sounds, "sessions": sessions,
+        "sounds": sounds, "sessions": sessions, "vadGuard": vad_guard,
     })
 }
 
@@ -198,8 +211,8 @@ pub fn list_reply(req: u64, sounds: Vec<Value>) -> Value {
     json!({ "op": "list", "req": req, "sounds": sounds })
 }
 
-pub fn state_reply(req: u64, sessions: Vec<Value>) -> Value {
-    json!({ "op": "state", "req": req, "sessions": sessions })
+pub fn state_reply(req: u64, sessions: Vec<Value>, vad_guard: bool) -> Value {
+    json!({ "op": "state", "req": req, "sessions": sessions, "vadGuard": vad_guard })
 }
 
 pub fn play_reply(req: u64, session: Value) -> Value {
@@ -257,6 +270,11 @@ mod tests {
             cmd(r#"{"op":"loop","req":6,"sessionId":9,"loop":false}"#),
             Cmd::Loop { req: 6, session_id: 9, r#loop: false }
         );
+        assert_eq!(
+            cmd(r#"{"op":"vad","req":9,"enable":true}"#),
+            Cmd::Vad { req: 9, enable: true }
+        );
+        assert!(parse_cmd(br#"{"op":"vad","req":9}"#).is_err(), "vad needs enable");
     }
 
     #[test]
@@ -318,10 +336,13 @@ mod tests {
             "1.0.0",
             vec![sound_json("memes/beep", "Beep", 500, "memes")],
             vec![],
+            true,
         );
         assert_eq!(h["op"], "hello");
         assert_eq!(h["sounds"][0]["durationMs"], 500);
         assert_eq!(h["sounds"][0]["dir"], "memes");
+        assert_eq!(h["vadGuard"], true);
+        assert_eq!(state_reply(0, vec![], false)["vadGuard"], false);
         let s = session_json(2, "beep", "Beep", "playing", 120, 500, 0.8, true);
         assert_eq!(s["sessionId"], 2);
         assert_eq!(s["phase"], "playing");

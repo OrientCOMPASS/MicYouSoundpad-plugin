@@ -140,6 +140,7 @@ pub fn set_master_gain(g: f32) {
 /// [`reclaim_all`].
 pub unsafe fn reset_all() {
     arm_scratch();
+    *DUCK.0.get() = (1.0, 0);
     for s in SLOTS.iter() {
         s.state.store(ST_EMPTY, Ordering::Relaxed);
         s.pos.store(0, Ordering::Relaxed);
@@ -350,6 +351,45 @@ pub fn host_mix_frames() -> u64 {
     HOST_MIX_FRAMES.load(Ordering::Relaxed)
 }
 
+// ── VAD anti-collision ducking (host render path only) ────────────────────
+//
+// The pad node sits after the host's AEC/VAD stages, so the frame handed to
+// `process_slice` is the (cleaned) MIC signal BEFORE our pad audio is added
+// — the perfect VAD source: zero latency, no Host API calls, and the pad can
+// never trigger itself. When speech is detected the pad mixdown is ducked to
+// 20% (attack 0.15/frame, release 0.02/frame — same feel as the classic
+// MicYouSoundpad client), leaving the voice dominant. Mic passthrough is
+// untouched. The local self-render path (`render_local_mono`, host idle)
+// never ducks: no stream = no mic = nothing to collide with.
+
+/// Anti-collision master switch (bus thread writes from config/commands).
+static VAD_GUARD_ON: AtomicBool = AtomicBool::new(false);
+/// Speech RMS threshold as f32 bits (bus thread writes).
+static VAD_THRESHOLD_BITS: AtomicU32 = AtomicU32::new(0.06f32.to_bits());
+/// Duck envelope + hangover counter — host audio-thread exclusive
+/// (process_slice is serialized), hence UnsafeCell is sound.
+struct DuckCell(std::cell::UnsafeCell<(f32, u32)>);
+// SAFETY: single-thread (host audio) ownership documented above.
+unsafe impl Sync for DuckCell {}
+static DUCK: DuckCell = DuckCell(std::cell::UnsafeCell::new((1.0, 0)));
+
+const DUCK_TARGET: f32 = 0.2;
+const DUCK_ATTACK: f32 = 0.15;
+const DUCK_RELEASE: f32 = 0.02;
+/// Speech hangover: keep ducking this many frames below threshold
+/// (~300 ms @ 10 ms frames) so ducking doesn't pump between syllables.
+const DUCK_HOLD_FRAMES: u32 = 30;
+
+pub fn set_vad_guard(on: bool) {
+    // The envelope itself is host-audio-thread exclusive; when the guard is
+    // off, `process_slice` re-pins it to unity, so toggling needs no reset.
+    VAD_GUARD_ON.store(on, Ordering::Release);
+}
+
+pub fn set_vad_threshold(t: f32) {
+    VAD_THRESHOLD_BITS.store(t.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+}
+
 /// True when any slot holds a live (mixing or fading) voice.
 fn any_live() -> bool {
     SLOTS.iter().any(|s| {
@@ -503,11 +543,28 @@ pub fn process_slice(data: &mut [f32], channels: usize) -> bool {
     let render_ch = channels.min(2);
     let mono_off = MAX_SCRATCH_FRAMES * 2;
 
+    // Anti-collision duck gain for this frame (computed from the MIC input,
+    // i.e. `data` before we add the pad).
+    let duck = if VAD_GUARD_ON.load(Ordering::Acquire) {
+        vad_duck_step(&data[..frames * channels])
+    } else {
+        // Keep the envelope settled at unity so enabling mid-stream is smooth.
+        let cell = unsafe { &mut *DUCK.0.get() };
+        cell.0 = 1.0;
+        cell.1 = 0;
+        1.0
+    };
+
     for chunk_start in (0..frames).step_by(MAX_SCRATCH_FRAMES) {
         let n = (frames - chunk_start).min(MAX_SCRATCH_FRAMES);
         let (render_area, rest) = scratch.split_at_mut(n * render_ch);
         render_area.fill(0.0);
         mix_voices(render_area, render_ch);
+        if duck != 1.0 {
+            for v in render_area.iter_mut() {
+                *v *= duck;
+            }
+        }
 
         // Tap: pre-master mono mixdown for the headphones stream.
         if let Some(ring) = tap_ring() {
@@ -544,6 +601,38 @@ pub fn process_slice(data: &mut [f32], channels: usize) -> bool {
         }
     }
     true
+}
+
+/// One VAD + duck-envelope step (host audio thread only).
+/// RMS over the incoming mic frame (stride-2 for cost), threshold compare
+/// with hangover, then the attack/release envelope — allocation-free.
+fn vad_duck_step(data: &[f32]) -> f32 {
+    let thr = f32::from_bits(VAD_THRESHOLD_BITS.load(Ordering::Relaxed));
+    // Normalized RMS of the mic frame (stride 2 keeps it ~240 MACs/frame).
+    let mut sum = 0.0f64;
+    let mut cnt = 0u32;
+    let mut i = 0;
+    while i < data.len() {
+        let n = data[i];
+        sum += (n * n) as f64;
+        cnt += 1;
+        i += 2;
+    }
+    let rms = if cnt > 0 { (sum / cnt as f64).sqrt() as f32 } else { 0.0 };
+    let cell = unsafe { &mut *DUCK.0.get() };
+    if rms >= thr {
+        cell.1 = DUCK_HOLD_FRAMES;
+    } else if cell.1 > 0 {
+        cell.1 -= 1;
+    }
+    let target = if rms >= thr || cell.1 > 0 { DUCK_TARGET } else { 1.0 };
+    let env = &mut cell.0;
+    if *env > target {
+        *env = (*env - DUCK_ATTACK).max(target);
+    } else if *env < target {
+        *env = (*env + DUCK_RELEASE).min(target);
+    }
+    *env
 }
 
 /// LOCAL real-time path (cpal callback, host chain provably idle): render
@@ -825,6 +914,85 @@ pub(crate) mod tests {
         }
         assert_eq!(slot(i).state(), ST_EMPTY);
         reclaim(i);
+    }
+
+    #[test]
+    fn vad_guard_ducks_pad_on_loud_input() {
+        let _g = lock();
+        set_master_gain(1.0);
+        start(11, 31, sine_track(48000, 1), 1.0, false);
+        set_vad_threshold(0.5);
+        set_vad_guard(true);
+        // Loud "mic" input (rms ~0.71 > 0.5): feed 40 frames so the attack
+        // envelope (0.15/frame) converges to the 0.2 duck target.
+        let mic = loud_input(480);
+        for _ in 0..40 {
+            let mut buf = mic.clone();
+            process_slice(&mut buf, 1);
+        }
+        let mut buf = mic.clone();
+        process_slice(&mut buf, 1);
+        // Extract the pad contribution: output = mic + pad*duck. Re-run the
+        // same input through an empty table for the pure mic baseline.
+        let ducked_peak = residual_peak(&buf, &mic);
+        begin_stop(11);
+        for _ in 0..6 {
+            let mut b = vec![0.0f32; 480];
+            process_slice(&mut b, 1);
+        }
+        reclaim(11);
+        // Baseline: pad alone at full gain.
+        start(11, 32, sine_track(48000, 1), 1.0, false);
+        set_vad_guard(false); // unity duck
+        for _ in 0..3 {
+            let mut b = vec![0.0f32; 480];
+            process_slice(&mut b, 1);
+        }
+        let mut full = vec![0.0f32; 480];
+        process_slice(&mut full, 1);
+        let full_peak = peak(&full);
+        drain(11, 4);
+        set_vad_guard(false);
+        set_vad_threshold(0.06);
+        let ratio = ducked_peak / full_peak.max(1e-6);
+        assert!(
+            (ratio - 0.2).abs() < 0.08,
+            "duck ratio {ratio} (expected ~0.2)"
+        );
+    }
+
+    #[test]
+    fn vad_guard_ignores_quiet_input() {
+        let _g = lock();
+        set_master_gain(1.0);
+        start(12, 33, sine_track(48000, 1), 1.0, false);
+        set_vad_threshold(0.5);
+        set_vad_guard(true);
+        // Silent mic: no duck — pad stays at full gain.
+        for _ in 0..3 {
+            let mut b = vec![0.0f32; 480];
+            process_slice(&mut b, 1);
+        }
+        let mut out = vec![0.0f32; 480];
+        process_slice(&mut out, 1);
+        assert!(peak(&out) > 0.8, "quiet input must not duck: {}", peak(&out));
+        drain(12, 4);
+        set_vad_guard(false);
+    }
+
+    fn loud_input(frames: usize) -> Vec<f32> {
+        (0..frames)
+            .map(|i| (2.0 * std::f64::consts::PI * 123.0 * i as f64 / 48000.0).sin() as f32)
+            .collect()
+    }
+
+    /// Peak of (mixed - original mic) = the pad contribution's peak.
+    fn residual_peak(mixed: &[f32], mic: &[f32]) -> f32 {
+        mixed
+            .iter()
+            .zip(mic)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max)
     }
 
     #[test]

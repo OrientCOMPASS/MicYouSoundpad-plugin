@@ -23,16 +23,17 @@ MicYou 宿主的跨设备插件消息（`docs/plugins/api-reference.md` §跨端
 | `seek` | `req`, `sessionId`, `positionMs` | 跳转进度（自动夹取到音轨内）。回 `ok` + 推 `state` |
 | `volume` | `req`, `sessionId`, `volume`(0–2) | 会话音量，**并按音效 id 写入记忆**（该音效下次播放的默认音量）。回 `ok` + 推 `state` |
 | `loop` | `req`, `sessionId`, `loop`(bool) | 会话循环开关。回 `ok` + 推 `state` |
+| `vad` | `req`, `enable`(bool) | 开/关**防撞**（VAD Ducking：检测到说话时把音效整体压低到 20%，停止说话后平滑恢复）。桌面端持久化为 `vadGuard` 配置。回 `ok` + 推 `state`（含最新 `vadGuard`，多端开关同步） |
 | `state` | `req` | 请求会话快照。回 `state` |
 
 ## 回包与推送（桌面 → 手机，`op`）
 
 | op | 字段 | 说明 |
 |---|---|---|
-| `hello` | `req`, `plugin`, `version`, `sounds[]`, `sessions[]` | 握手应答 / 设备连接时的主动广播（`req:0`） |
+| `hello` | `req`, `plugin`, `version`, `sounds[]`, `sessions[]`, `vadGuard` | 握手应答 / 设备连接时的主动广播（`req:0`） |
 | `list` | `req`, `sounds[]` | 音效列表（应答或目录变化推送） |
 | `play` | `req`, `session` | 播放受理，`session.phase = "loading"` |
-| `state` | `req`, `sessions[]` | 会话快照（应答，或播放开始/结束/停止/参数变化时推送 `req:0`） |
+| `state` | `req`, `sessions[]`, `vadGuard` | 会话快照（应答，或播放开始/结束/停止/参数/防撞变化时推送 `req:0`） |
 | `ok` | `req`, `op` | seek / volume / loop 的确认 |
 | `error` | `req`, `message` | 失败原因（unknown sound / all voices busy / unknown session …） |
 
@@ -58,6 +59,13 @@ MicYou 宿主的跨设备插件消息（`docs/plugins/api-reference.md` §跨端
 ```
 
 进度模型：桌面只在**离散变化**时推送 `state`（播放开始、自然结束、停止、参数修改）；`positionMs` 的连续推进由手机端**本地插值**（收到快照后按墙钟外推，`loop` 会话按 `durationMs` 取模），并可发 `state` 轮询纠偏。
+
+## 防撞（VAD Ducking）语义
+
+- 检测源：桌面插件位于宿主处理链 AEC/VAD 之后，`process` 收到的帧即"已降噪、未加音效"的麦克风信号——插件在实时线程内逐帧算归一化 RMS（步长 2 采样），**音效永远不会触发自己**
+- 判定：`rms ≥ vadThreshold`（默认 0.06，可配）→ 说话中；低于阈值后保持 300ms 挂起（防音节间泵机）
+- 动作：音效混音整体 ×0.2（attack 0.15/帧 ≈ 数十 ms 让位，release 0.02/帧 ≈ 0.5s 平滑恢复）；**不拦截播放**、不影响麦克风本身
+- 开关：手机 `vad` 命令 / 桌面面板 / 设置表单三处等价，均持久化 `vadGuard` 并经 `state` 推送同步到所有端
 
 ## 会话生命周期
 

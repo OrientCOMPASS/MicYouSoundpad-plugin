@@ -39,6 +39,12 @@ static LOCAL_GAIN_BITS: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
 /// Set by the watchdog while any voice is live; the worker uses it (with a
 /// 3 s idle hysteresis) to play/pause the stream.
 static LOCAL_WANTED: AtomicBool = AtomicBool::new(false);
+/// Host ear-return (监听) is ON — the host already routes the pad mix to the
+/// headphones, so local output must go SILENT IMMEDIATELY (the callback
+/// checks this every ~10 ms; the worker then pauses the stream without the
+/// idle hysteresis). This fixes the earlier ~2-3 s double-audio tail: the
+/// hysteresis was designed for session-idle churn, not for suppression.
+static SUPPRESSED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_local_gain(g: f64) {
     LOCAL_GAIN_BITS.store((g.clamp(0.0, 2.0) as f32).to_bits(), Ordering::Relaxed);
@@ -50,6 +56,14 @@ pub fn set_wanted(v: bool) {
 
 pub fn wanted() -> bool {
     LOCAL_WANTED.load(Ordering::Acquire)
+}
+
+pub fn set_suppressed(v: bool) {
+    SUPPRESSED.store(v, Ordering::Release);
+}
+
+pub fn suppressed() -> bool {
+    SUPPRESSED.load(Ordering::Acquire)
 }
 
 /// Idle hysteresis before pausing the stream (avoid device churn between
@@ -102,7 +116,7 @@ impl CbState {
 
     /// Fill `self.mono[..frames]` with device-rate mono pad audio.
     fn fill_mono(&mut self, frames: usize) {
-        // ── gate update ──
+        // ── gate update (host liveness beacon) ──
         let beacon = mixer::host_mix_frames();
         if beacon != self.last_beacon {
             self.last_beacon = beacon;
@@ -117,6 +131,22 @@ impl CbState {
                 ring.clear(); // consumer-owned: drop stale tap audio
             }
             self.fifo.clear();
+        }
+
+        // ── host-monitor suppression: while the host ear-return is ON *and*
+        // the host chain is actually rendering (it routes the pad mix to the
+        // headphones itself), go silent NOW (≤ one callback ≈ 10 ms) and drop
+        // buffered tap audio so un-suppressing never plays a stale burst.
+        // Host idle (not streaming) → the monitor has nothing to play → keep
+        // the local preview alive (self-render below).
+        if suppressed() && self.host_active {
+            self.mono[..frames].fill(0.0);
+            self.fifo.clear();
+            if let Some(ring) = mixer::tap() {
+                ring.clear();
+            }
+            self.primed = false;
+            return;
         }
 
         if self.rate == TARGET_RATE {
