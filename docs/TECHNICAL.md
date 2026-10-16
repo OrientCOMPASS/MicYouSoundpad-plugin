@@ -127,6 +127,21 @@ EMPTY ──reserve(总线)──► LOADING ──publish(worker, CAS)──►
 
 > **回退记录**：曾尝试"内存快照 + 解码 worker ≥500ms 节流落盘"以消除实例锁内的文件 I/O（卡顿归因 A 类）。实测：卡顿无改善，且面板刷新延迟恶化到 ~10s 量级——worker 房检查循环里落盘与**周期性目录重扫**（每个文件都要打开做容器探测）串行，库大时 flush 被重扫长期饿死。教训：跨线程延迟写把"面板可见性"耦合进了 worker 的忙闲，得不偿失；卡顿归因保留在案（§12 待查），写入路径回到最简直写。
 
+## 6.6 面板桥接的两个宿主约定（实测踩坑）
+
+1. **`trigger` 的 payload 必须是字符串**：宿主桥接实现为
+   `command('plugin_trigger', { pluginId, action, payload: (args.payload ?? null) as string|null })`
+   （usePluginPanelBridge.ts），传对象会被 Tauri 命令反序列化**拒绝**，且面板侧
+   promise 被 catch 吞掉表现为"按钮没反应"。宿主自家的 buttons 路由同样
+   `JSON.stringify({id})`。滑杆/开关不受影响——它们经 `set_config` →
+   `config:changed` 事件生效，`trigger('apply')` 无 payload（null 合法）。
+   插件侧 `parse_ui_action` 兼容裸参数对象与 `{"action","payload"}` 包装两种形态。
+2. **设置侧边栏标题 = `插件本地化名 · ui.panels[].label` 固定拼接**
+   （usePluginPanels.ts，无去重）：name 与 label 同名会显示
+   "Soundpad · Soundpad"。侧边栏是 route=panel 插件的唯一 GUI 入口
+   （`sidebar:false` 只剩 open_window），故 label 取有语义的 **Console**；
+   `nameI18n` 按用户要求不译"音效板"，统一 **Soundpad**。
+
 ## 7. 生命周期与双进程现实
 
 - `init`：拷贝 host 表（按值）→ `mixer::reset_all()`（宿主保证 DSP 链未挂载，无并发 process）→ 解析 plugin_dir → 空目录时生成演示音效（init 允许文件 I/O）→ 读配置 → 同步首扫 + 启动 worker → arm watchdog → 面板图标 + 首写 `sp_state`

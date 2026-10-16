@@ -161,7 +161,7 @@ function call(api, args) {
 
 const T = {
   'zh-CN': {
-    sub: '手机遥控音效板：播放音效混入麦克风流（对方与耳返都能听到）。把音频文件（WAV/MP3/FLAC/OGG/M4A）放进插件的 sounds/ 目录即可出现在下方与手机端。',
+    sub: '手机遥控 Soundpad：播放音效混入麦克风流（对方与耳返都能听到）。把音频文件（WAV/MP3/FLAC/OGG/M4A）放进插件的 sounds/ 目录即可出现在下方与手机端。',
     playing: '正在播放', noSessions: '当前没有播放中的音效',
     stopAll: '全部停止', stop: '停止',
     sounds: '音效库', rescan: '重新扫描',
@@ -293,8 +293,16 @@ function render(cfg) {
 }
 
 async function trigger(action, payload) {
-  try { await call('trigger', { action, payload: payload || {} }); }
-  catch (e) { console.warn(e); }
+  // 宿主桥接契约：plugin_trigger 的 payload 必须是字符串（或 null）——
+  // 传对象会被 Tauri 命令反序列化拒绝（此前播放/停止按钮无效的根因）。
+  try {
+    await call('trigger', { action, payload: JSON.stringify(payload || {}) });
+  } catch (e) {
+    console.warn(e);
+    const box = $('errBox');
+    box.style.display = 'block';
+    box.textContent = t.errPrefix + (e && e.message ? e.message : e);
+  }
   setTimeout(refresh, 250);
 }
 
