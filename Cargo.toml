@@ -3,7 +3,7 @@ name = "soundpad"
 version = "1.0.0"
 edition = "2021"
 license = "Unlicense"
-description = "MicYou native DSP plugin: phone-controlled soundpad — plays WAV sounds with per-session volume/seek/loop and multi-voice mixing into the mic stream"
+description = "MicYou native DSP plugin: phone-controlled soundpad — plays WAV/MP3/FLAC/OGG/M4A sounds with per-session volume/seek/loop and multi-voice mixing into the mic stream"
 publish = false
 
 # Standalone crate: build on demand with `cargo build --release`
@@ -16,6 +16,12 @@ crate-type = ["cdylib"]
 
 [dependencies]
 serde_json = "1"
+# 纯 Rust 解码框架（无 C 依赖，四平台 CI 直接可编）：
+# MP3 / FLAC / OGG Vorbis / AAC(M4A, ISO-MP4) + 容器探测。
+# WAV 仍走自带的轻量解码器（src/wav.rs，头部探测更快、已充分测试）。
+symphonia = { version = "0.5", default-features = false, features = [
+  "mp3", "flac", "ogg", "vorbis", "aac", "isomp4",
+] }
 
 [profile.release]
 opt-level = 3

@@ -42,7 +42,7 @@ MicYou 宿主的跨设备插件消息（`docs/plugins/api-reference.md` §跨端
 { "id": "laugh", "label": "大笑", "durationMs": 2350 }
 ```
 
-`durationMs` 来自 WAV 头解析；`0` 表示文件存在但头不可解析（播放时会报 `error`）。
+`durationMs` 来自容器元数据探测（WAV 头 / MP3 Xing / FLAC STREAMINFO / OGG granule / M4A）；`0` 表示暂不可知（播放开始后由轨道真实长度纠正）。
 
 ### `sessions[]` 条目
 

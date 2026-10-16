@@ -13,7 +13,7 @@ MicYou 原生插件 `opss.soundpad` 的实现说明：需求分解、宿主机�
 | 混入麦克风流 | 注册为 DSP 节点（`kind: dsp`，`insertAfter: VAD`，`realtimeSafe: true`），在 `micyou_plugin_process` 中做加性混音。**不用**宿主 `play_sound`：它排队播整只 WAV，无进度/音量/循环/多声部控制 |
 | 手机发现插件 | 手机经跨设备 `PluginMessage` 发 `hello`；插件回包（含音效列表）即"确定有 soundpad 插件" |
 | 多声部 + 传输控制 | 自研 16 槽位实时混音器（§4），每条播放 = 一个会话 |
-| 音效来源 | 插件目录 `sounds/*.wav`，目录扫描 + 头部探测时长；首次运行自动生成演示音效 |
+| 音效来源 | 插件目录 `sounds/`（WAV/MP3/FLAC/OGG/M4A），目录扫描 + 元数据探测时长；首次运行自动生成演示音效 |
 | 桌面本地控制 | panel.html（桥接 `get_config`/`trigger`），与手机端共用同一会话状态机 |
 
 ## 2. 宿主机制结论（实现依据）
@@ -70,7 +70,8 @@ EMPTY ──reserve(总线)──► LOADING ──publish(worker, CAS)──►
 ## 5. 解码 worker（decode.rs）
 
 - **命令队列**：`mpsc`，总线线程非阻塞 `send`；worker `recv_timeout(200ms)` 兼做空闲期目录重扫（重扫间隔 ≥2 s，rescan 请求先到先记账后执行，不丢请求）
-- **解码链**：WAV 头遍历（跳 LIST 等填充块）→ PCM 8/16/24/32 与 float 32/64 → f32 交错 → >2ch 降混 → 非 48 kHz 时 SincResampler（8-tap Hann 窗 sinc，512 相位查表，与 Focus-Capture 同款，分块喂入保持边界连续）
+- **解码链**：WAV 走自带轻量解码器（头遍历跳 LIST 等填充块，PCM 8/16/24/32 与 float 32/64）；MP3/FLAC/OGG-Vorbis/AAC-M4A 走 **symphonia**（纯 Rust，无 C 依赖，四平台 CI 直接可编）→ f32 交错 → >2ch 降混（立体声保留前对）→ 非 48 kHz 时 SincResampler（8-tap Hann 窗 sinc，512 相位查表，与 Focus-Capture 同款，分块喂入保持边界连续）
+- **时长探测**（列表用，不解码整曲）：WAV = data 块大小/字节率；FLAC/M4A/Xing-MP3 = 容器帧数 × time_base；OGG = 尾页 granule position ÷ 采样率（Opus 页固定按 48 kHz）；都拿不到 → 0（播放后由轨道真实长度纠正）
 - **轨道缓存**：键 = `路径|mtime|大小`，值 = `Arc<Track>`；上限 192 MiB，超限 FIFO 淘汰。淘汰只移除缓存项——在用会话自持 Arc，释放发生在最后一个持有者（总线线程 reclaim）处，音频线程永不 free
 - **失败路径**：解码失败 → `mixer::fail(slot)`（LOADING→EMPTY）+ `JobResult{phase: FAILED, error}`；watchdog 摘除会话、必要时回 `error` 给手机
 - **取消竞态**：LOADING 期间 stop → 总线置 `cancel`；worker publish 前查 cancel（是→槽位直接 EMPTY），CAS 成功后再查一次（补窗口期），双检收敛
@@ -115,6 +116,5 @@ EMPTY ──reserve(总线)──► LOADING ──publish(worker, CAS)──►
 ## 10. 已知限制
 
 - zip 单包每平台只能带一个产物 → Linux 仅 x86_64（Windows on ARM 走仿真、macOS universal 双架构）
-- 仅 WAV：有意零解码依赖（mp3/ogg 需引入大依赖或宿主 API）
 - `hello` 广播在 GUI+CLI 双进程下收到两份（§7）
 - WASM 运行时不可用本插件形态（realtimeSafe DSP + 跨端消息为 native 专属组合）

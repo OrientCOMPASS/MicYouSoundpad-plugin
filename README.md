@@ -11,7 +11,8 @@
 | 平台 | **Windows（x86_64）· Linux（x86_64）· macOS（universal：arm64 + x86_64）**；单包分发，宿主按平台自选 |
 | 插件类型 | `dsp`（实时处理链节点，`realtimeSafe: true`，`insertAfter: VAD`） |
 | 权限 | `dsp.node`、`config.read`、`config.write`、`message.send`、`device.list`（无网络/剪贴板权限） |
-| 依赖 | 无外部运行库（纯 Rust + 系统库；单文件 ~650 KB） |
+| 音频格式 | WAV · MP3 · FLAC · OGG (Vorbis) · M4A/AAC（纯 Rust 解码，[symphonia](https://github.com/pdeljanov/Symphonia)） |
+| 依赖 | 无外部运行库（纯 Rust + 系统库） |
 | 安卓端 | [OrientCOMPASS/MicYou](https://github.com/OrientCOMPASS/MicYou) `soundpad` 分支（连接桌面端后自动出现 SoundPad 按钮） |
 | 许可 | Unlicense（公有领域） |
 
@@ -26,11 +27,11 @@
 
 ### 音效库
 
-- 音效 = 插件目录下 `sounds/` 里的 **WAV 文件**（PCM 8/16/24/32-bit、float 32/64-bit，任意采样率/声道数，插件内自动重采样到 48 kHz）
+- 音效 = 插件目录下 `sounds/` 里的音频文件：**WAV**（PCM 8/16/24/32-bit、float 32/64-bit）· **MP3** · **FLAC** · **OGG**(Vorbis) · **M4A/AAC**，任意采样率/声道数，插件内自动重采样到 48 kHz
 - 首次启用时若 `sounds/` 为空，自动生成 3 个演示音效（beep / ding / chime）
 - 增删文件后点面板「重新扫描」（插件每 ~2 秒也会自动扫描一次），手机端音效列表随之更新
-- 其它格式先转 WAV：`ffmpeg -i in.mp3 -ar 48000 out.wav`
-- 音效 id = 文件名主干（`laugh.wav` → `laugh`）；显示名可在插件设置 `sounds` 配置里用 `{"id":"laugh","label":"大笑"}` 覆盖
+- 其它格式（如 Opus）可先转换：`ffmpeg -i in.opus out.mp3`
+- 音效 id = 文件名主干（`laugh.mp3` → `laugh`；同 id 冲突时按文件名序取先者）；显示名可在插件设置 `sounds` 配置里用 `{"id":"laugh","label":"大笑"}` 覆盖
 
 ### 手机端（安卓）
 
@@ -74,11 +75,12 @@ CI（GitHub Actions）：push → 四目标矩阵构建 + 单测 + `soundpad-dev
 - **16 声部槽位表**：原子状态机 `EMPTY → LOADING → ACTIVE → STOPPING → EMPTY`，轨道以 `Arc<Track>` 泄漏指针交接，回收只发生在总线线程且以 Release/Acquire 与音频线程握手
 - **10 ms 淡入淡出**包络，起停无咔哒；链尾宿主统一 soft-clip，插件只做线性加性混音
 - 解码缓存（≤192 MiB，按 路径+mtime+大小 键控），同一音效重播零解码
+- 非 WAV 格式经 symphonia 解码（MP3/FLAC/OGG Vorbis/AAC-M4A，纯 Rust 零 C 依赖）；时长列表用容器元数据探测（MP3 Xing / FLAC STREAMINFO / OGG 末页 granule / M4A），无需整曲解码
 - 设计细节见 [docs/TECHNICAL.md](docs/TECHNICAL.md)
 
 ## 已知限制
 
 - Linux aarch64 未提供构建（zip 单包每平台只能携带一个 `.so`）；Windows on ARM 经 x86_64 仿真运行
-- 仅支持 WAV（无 mp3/ogg 解码依赖是有意为之：插件保持零外部库、~650 KB）
+- 不支持 Opus（symphonia 无 Opus 解码器；.opus 请先转 MP3/OGG-Vorbis）
 - 播放进度推送为"离散变化即推 + 手机端本地插值/轮询"，非逐帧同步
 - 宿主全局快捷键（`register_hotkey`）仅 X11：本插件未注册快捷键，控制在手机/面板端完成

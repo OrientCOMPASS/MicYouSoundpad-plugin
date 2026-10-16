@@ -32,6 +32,7 @@ mod abi;
 mod decode;
 mod mixer;
 mod protocol;
+mod symph;
 #[macro_use]
 mod trace;
 mod resample;

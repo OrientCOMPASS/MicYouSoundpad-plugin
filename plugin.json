@@ -2,10 +2,10 @@
   "id": "opss.soundpad",
   "name": "Soundpad",
   "version": "1.0.0",
-  "description": "Phone-controlled soundpad: play WAV sounds from the plugin's sounds/ directory, mixed into the MicYou mic stream. Multi-voice, with per-session volume / seek / loop driven from the MicYou Android app.",
+  "description": "Phone-controlled soundpad: play sounds (WAV / MP3 / FLAC / OGG / M4A) from the plugin's sounds/ directory, mixed into the MicYou mic stream. Multi-voice, with per-session volume / seek / loop driven from the MicYou Android app.",
   "descriptionI18n": {
-    "zh": "手机遥控音效板：播放插件 sounds/ 目录中的 WAV 音效并混入 MicYou 麦克风流。支持多音效同时播放，安卓端可控制每条播放的进度、音量与循环。",
-    "zh-CN": "手机遥控音效板：播放插件 sounds/ 目录中的 WAV 音效并混入 MicYou 麦克风流。支持多音效同时播放，安卓端可控制每条播放的进度、音量与循环。"
+    "zh": "手机遥控音效板：播放插件 sounds/ 目录中的音效（WAV/MP3/FLAC/OGG/M4A）并混入 MicYou 麦克风流。支持多音效同时播放，安卓端可控制每条播放的进度、音量与循环。",
+    "zh-CN": "手机遥控音效板：播放插件 sounds/ 目录中的音效（WAV/MP3/FLAC/OGG/M4A）并混入 MicYou 麦克风流。支持多音效同时播放，安卓端可控制每条播放的进度、音量与循环。"
   },
   "nameI18n": {
     "zh": "音效板",

@@ -1,6 +1,7 @@
 //! Decode worker: one dedicated thread that owns every blocking operation —
-//! WAV file I/O, decoding, resampling to 48 kHz, sound-directory rescans and
-//! the decoded-track cache.
+//! audio file I/O (WAV via `wav.rs`; MP3/FLAC/OGG/M4A via `symph.rs`),
+//! decoding, resampling to 48 kHz, sound-directory rescans and the
+//! decoded-track cache.
 //!
 //! Why a worker: the bus dispatcher holds the plugin-instance lock across
 //! `handle_message`, and the host audio thread blocks on that same lock in
@@ -178,11 +179,7 @@ pub fn scan_sounds(dir: &Path, labels: &HashMap<String, String>) -> Vec<SoundEnt
             continue;
         }
         let path = entry.path();
-        let is_wav = path
-            .extension()
-            .map(|e| e.to_string_lossy().eq_ignore_ascii_case("wav"))
-            .unwrap_or(false);
-        if !is_wav {
+        if !crate::symph::is_supported(&path) {
             continue;
         }
         let Some(stem) = path.file_stem() else { continue };
@@ -190,9 +187,10 @@ pub fn scan_sounds(dir: &Path, labels: &HashMap<String, String>) -> Vec<SoundEnt
         if id.is_empty() || id.len() > 120 {
             continue;
         }
-        // Header probe only (no audio data read). Undecodable files are
-        // listed with duration 0 so the phone can surface the error on play.
-        let duration_ms = wav::probe_duration_ms(&path).unwrap_or(0);
+        // Header/metadata probe only (no audio data read). Undecodable files
+        // are listed with duration 0 so the phone can surface the error on
+        // play.
+        let duration_ms = probe_any(&path).unwrap_or(0);
         let file = path
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
@@ -210,45 +208,85 @@ pub fn scan_sounds(dir: &Path, labels: &HashMap<String, String>) -> Vec<SoundEnt
             duration_ms,
         });
     }
-    // Stable, human-friendly order.
-    out.sort_by(|a, b| a.id.to_lowercase().cmp(&b.id.to_lowercase()));
+    // Stable, human-friendly order; on id collisions (beep.wav + beep.mp3)
+    // the alphabetically-first file wins deterministically.
+    out.sort_by(|a, b| {
+        a.id
+            .to_lowercase()
+            .cmp(&b.id.to_lowercase())
+            .then_with(|| a.file.to_lowercase().cmp(&b.file.to_lowercase()))
+    });
+    out.dedup_by(|a, b| a.id == b.id);
     out
 }
 
-/// Decode + resample + downmix-to-≤2ch a WAV file into a mixer [`Track`].
+/// Duration probe dispatched by extension (WAV header vs container metadata).
+fn probe_any(path: &Path) -> Result<u64, String> {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if ext == "wav" {
+        wav::probe_duration_ms(path)
+    } else {
+        crate::symph::probe_duration_ms(path)
+    }
+}
+
+/// Read + decode any supported file to `(rate, channels, interleaved f32)`.
+/// WAV goes through the built-in decoder; everything else through symphonia;
+/// extensionless files are sniffed (WAV first, then format probing).
+fn read_raw(path: &Path) -> Result<(u32, usize, Vec<f32>), String> {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if ext == "wav" {
+        let d = wav::decode(path)?;
+        return Ok((d.sample_rate, d.channels, d.samples));
+    }
+    if ext.is_empty() {
+        if let Ok(d) = wav::decode(path) {
+            return Ok((d.sample_rate, d.channels, d.samples));
+        }
+    }
+    let r = crate::symph::decode(path)?;
+    Ok((r.sample_rate, r.channels, r.samples))
+}
+
+/// Decode + resample + downmix-to-≤2ch an audio file into a mixer [`Track`].
 fn load_track(path: &Path, cache: &mut TrackCache) -> Result<Arc<Track>, String> {
     if let Some(t) = cache.get(path) {
         return Ok(t);
     }
-    let d = wav::decode(path)?;
-    if d.samples.is_empty() {
+    let (src_rate, src_channels, samples) = read_raw(path)?;
+    if samples.is_empty() || src_channels == 0 || src_rate == 0 {
         return Err("file contains no audio data".into());
     }
-    let channels = d.channels.clamp(1, 2);
-    // Downmix to the stored channel count first (average), then resample
-    // each channel with the shared sinc converter.
+    let channels = src_channels.clamp(1, 2);
+    // Downmix to the stored channel count first (average / front-pair), then
+    // resample each plane with the shared sinc converter.
+    let src_frames = samples.len() / src_channels;
     let mono_or_stereo: Vec<Vec<f32>> = {
-        let frames = d.frames();
-        let mut planes = vec![Vec::with_capacity(frames); channels];
-        if d.channels == channels {
-            for frame in d.samples.chunks_exact(channels) {
+        let mut planes = vec![Vec::with_capacity(src_frames); channels];
+        if src_channels == channels {
+            for frame in samples.chunks_exact(channels) {
                 for (c, &v) in frame.iter().enumerate() {
                     planes[c].push(v);
                 }
             }
+        } else if channels == 2 {
+            // N > 2 channels: keep the front pair.
+            for frame in samples.chunks_exact(src_channels) {
+                let l = frame[0];
+                let r = frame.get(1).copied().unwrap_or(l);
+                planes[0].push(l);
+                planes[1].push(r);
+            }
         } else {
-            // N > 2 channels: average groups down to `channels` planes
-            // (front pair kept separate when downmixing to stereo).
-            for frame in d.samples.chunks_exact(d.channels) {
-                if channels == 2 {
-                    let l = frame[0];
-                    let r = frame.get(1).copied().unwrap_or(l);
-                    planes[0].push(l);
-                    planes[1].push(r);
-                } else {
-                    let sum: f32 = frame.iter().sum();
-                    planes[0].push(sum / d.channels as f32);
-                }
+            for frame in samples.chunks_exact(src_channels) {
+                let sum: f32 = frame.iter().sum();
+                planes[0].push(sum / src_channels as f32);
             }
         }
         planes
@@ -256,12 +294,12 @@ fn load_track(path: &Path, cache: &mut TrackCache) -> Result<Arc<Track>, String>
     let resampled: Vec<Vec<f32>> = mono_or_stereo
         .into_iter()
         .map(|plane| {
-            if d.sample_rate == TARGET_RATE {
+            if src_rate == TARGET_RATE {
                 plane
             } else {
-                let mut r = SincResampler::new(d.sample_rate, TARGET_RATE);
+                let mut r = SincResampler::new(src_rate, TARGET_RATE);
                 let mut out =
-                    Vec::with_capacity(plane.len() * TARGET_RATE as usize / d.sample_rate.max(1) as usize + 64);
+                    Vec::with_capacity(plane.len() * TARGET_RATE as usize / src_rate.max(1) as usize + 64);
                 // Feed in chunks to keep the resampler buffer small; it
                 // preserves continuity across boundaries (see its tests).
                 // NOTE: process() clears its output vector each call.
@@ -278,14 +316,14 @@ fn load_track(path: &Path, cache: &mut TrackCache) -> Result<Arc<Track>, String>
     if frames == 0 {
         return Err("resampling produced no frames".into());
     }
-    let mut samples = Vec::with_capacity(frames * channels);
+    let mut interleaved = Vec::with_capacity(frames * channels);
     for fi in 0..frames {
         for plane in &resampled {
-            samples.push(plane[fi]);
+            interleaved.push(plane[fi]);
         }
     }
     let track = Arc::new(Track {
-        samples: samples.into_boxed_slice(),
+        samples: interleaved.into_boxed_slice(),
         channels,
         frames,
     });
@@ -543,6 +581,60 @@ mod tests {
         assert!(t.samples[2 * 50] > 0.4 && t.samples[2 * 50] < 0.6, "L50 ~ 0.5");
         assert!(t.samples[2 * 50 + 1] < -0.4, "R50 ~ -0.5");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn fixtures_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    }
+
+    const FIXTURES: [&str; 5] = [
+        "sample_mp3.mp3",
+        "sample_flac.flac",
+        "sample_ogg.ogg",
+        "sample_m4a.m4a",
+        "sample_stereo.mp3",
+    ];
+
+    #[test]
+    fn fixtures_decode_all_formats() {
+        let dir = fixtures_dir();
+        let mut cache = TrackCache::new(64);
+        for name in FIXTURES {
+            let t = load_track(&dir.join(name), &mut cache)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            // 0.5 s @ 48 kHz = 24000 frames; allow ±10% for codec
+            // padding/priming and encoder delay.
+            assert!(
+                (t.frames as i64 - 24000).abs() <= 2400,
+                "{name}: {} frames",
+                t.frames
+            );
+            let want_ch = if name.contains("stereo") { 2 } else { 1 };
+            assert_eq!(t.channels, want_ch, "{name}: channels");
+            let rms = (t.samples.iter().map(|x| x * x).sum::<f32>()
+                / t.samples.len().max(1) as f32)
+                .sqrt();
+            assert!(rms > 0.05, "{name} decoded too quiet: {rms}");
+        }
+    }
+
+    #[test]
+    fn fixtures_probe_durations() {
+        let dir = fixtures_dir();
+        for name in FIXTURES {
+            let ms = probe_any(&dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!((ms as i64 - 500).abs() <= 150, "{name}: {ms} ms");
+        }
+    }
+
+    #[test]
+    fn scan_lists_supported_formats_only() {
+        let dir = fixtures_dir();
+        let list = scan_sounds(&dir, &HashMap::new());
+        assert_eq!(list.len(), FIXTURES.len());
+        for e in &list {
+            assert!(e.duration_ms > 300, "{}: {} ms", e.id, e.duration_ms);
+        }
     }
 
     #[test]
