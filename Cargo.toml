@@ -16,6 +16,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 serde_json = "1"
+# 本地耳机输出（"播放到耳机"，独立于宿主监听）：跨平台音频输出
+# （Windows WASAPI / macOS CoreAudio / Linux ALSA）。
+cpal = "0.18"
 # 纯 Rust 解码框架（无 C 依赖，四平台 CI 直接可编）：
 # MP3 / FLAC / OGG Vorbis / AAC(M4A, ISO-MP4) + 容器探测。
 # WAV 仍走自带的轻量解码器（src/wav.rs，头部探测更快、已充分测试）。

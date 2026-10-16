@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 mod abi;
 mod decode;
 mod mixer;
+mod monitor;
 mod protocol;
+mod ring;
 mod symph;
 #[macro_use]
 mod trace;
@@ -102,8 +104,14 @@ struct State {
     ticks: u64,
     worker: Option<DecodeWorker>,
     sounds_dir: PathBuf,
+    /// Raw `soundsDir` config value ("" = built-in <plugin dir>/sounds).
+    sounds_dir_cfg: String,
     last_error: String,
     master_volume: f64,
+    local_output: bool,
+    local_volume: f64,
+    /// Last local-output device error (surfaced in sp_state for the panel).
+    local_error: String,
     /// Last `sp_state` JSON written to config (dedupe: write only on change).
     last_panel_json: String,
     /// Registry version already pushed to the phone (list-change detection).
@@ -120,8 +128,12 @@ impl State {
             ticks: 0,
             worker: None,
             sounds_dir: PathBuf::new(),
+            sounds_dir_cfg: String::new(),
             last_error: String::new(),
             master_volume: 1.0,
+            local_output: true,
+            local_volume: 1.0,
+            local_error: String::new(),
             last_panel_json: String::new(),
             pushed_registry_version: 0,
         }
@@ -179,19 +191,28 @@ pub unsafe extern "C" fn micyou_plugin_init(host: *const mpl_host_api_t) -> abi:
         let mut s = state();
         *s = State::new();
 
-        // Sound library lives in <plugin dir>/sounds.
+        // Sound library: `soundsDir` config override, else <plugin dir>/sounds.
         let dir = abi::plugin_dir();
-        if dir.is_empty() {
+        s.sounds_dir_cfg = config_string("soundsDir", "");
+        let custom = !s.sounds_dir_cfg.trim().is_empty();
+        if custom {
+            s.sounds_dir = PathBuf::from(s.sounds_dir_cfg.trim());
+        } else if dir.is_empty() {
             s.last_error = "plugin_dir unavailable — sound library disabled".into();
             abi::log_error(&s.last_error);
         } else {
             s.sounds_dir = PathBuf::from(&dir).join("sounds");
+            // First-run UX: seed demo sounds into the BUILT-IN dir only
+            // (never write into a user-chosen custom folder).
             ensure_demo_sounds(&s.sounds_dir);
         }
 
-        // Config: master volume + label overrides.
+        // Config: master volume, local headphone output, label overrides.
         s.master_volume = config_f64("masterVolume", 1.0).clamp(0.0, 2.0);
         mixer::set_master_gain(s.master_volume as f32);
+        s.local_output = config_bool("localOutput", true);
+        s.local_volume = config_f64("localVolume", 1.0).clamp(0.0, 2.0);
+        monitor::set_local_gain(s.local_volume);
         let labels = label_map_from_config();
 
         // Decode worker + initial synchronous scan (init may do file I/O;
@@ -202,7 +223,12 @@ pub unsafe extern "C" fn micyou_plugin_init(host: *const mpl_host_api_t) -> abi:
             let initial = decode::scan_sounds(&s.sounds_dir, &labels);
             worker.registry.replace(initial);
         }
-        worker.submit(Job::Rescan);
+        worker.submit(Job::Rescan(s.sounds_dir.clone()));
+        if s.local_output {
+            // Device open happens on the worker thread (never here, and
+            // never in a message handler); failures land in local_error.
+            worker.submit(Job::LocalSet(true));
+        }
         s.worker = Some(worker);
 
         // Watchdog: reconciliation, rescan pacing, state pushes.
@@ -235,7 +261,9 @@ pub extern "C" fn micyou_plugin_deinit() {
         sptrace!("deinit enter");
         let mut s = state();
         // Stop every voice, then shut the worker down (bounded join — the
-        // library is about to be unmapped).
+        // library is about to be unmapped). The worker's exit drops the
+        // local-output stream (closing the device, disarming the tap).
+        monitor::set_wanted(false);
         for r in s.sessions.iter() {
             mixer::begin_stop(r.slot);
         }
@@ -572,6 +600,8 @@ fn stop_all(s: &mut State) {
 }
 
 fn request_rescan(s: &mut State) {
+    // The flag path rescans the worker's last-known dir; a pending soundsDir
+    // change travels as an explicit Rescan job from apply_config.
     if let Some(w) = s.worker.as_ref() {
         w.request_rescan();
     }
@@ -662,18 +692,28 @@ fn watchdog(s: &mut State) {
         }
     }
 
-    // 3) Periodic housekeeping (~every 2 s): config re-read + rescan pacing.
+    // 3) Local-output play/pause gate (worker applies it with a 3 s idle
+    //    hysteresis; pausing keeps the device stream alive but silent-free).
+    monitor::set_wanted(s.local_output && !s.sessions.is_empty());
+
+    // 4) Periodic housekeeping (~every 2 s): full config re-read (JSON-edited
+    //    changes also land without re-enabling) + rescan pacing.
     if s.ticks % 8 == 0 {
-        let mv = config_f64("masterVolume", 1.0).clamp(0.0, 2.0);
-        if (mv - s.master_volume).abs() > 1e-6 {
-            s.master_volume = mv;
-            mixer::set_master_gain(mv as f32);
+        apply_config(s);
+        request_rescan(s);
+        let lerr = s
+            .worker
+            .as_ref()
+            .and_then(|w| w.local_error.lock().ok())
+            .map(|e| e.clone())
+            .unwrap_or_default();
+        if lerr != s.local_error {
+            s.local_error = lerr;
             changed = true;
         }
-        request_rescan(s);
     }
 
-    // 4) Publish state on discrete changes (phone + panel).
+    // 5) Publish state on discrete changes (phone + panel).
     if changed {
         push_state(s, 0);
         write_panel_state(s);
@@ -797,6 +837,9 @@ fn write_panel_state(s: &mut State) {
         "masterVolume": s.master_volume,
         "soundsDir": s.sounds_dir.display().to_string(),
         "peer": s.peer.clone().unwrap_or_default(),
+        "localOutput": s.local_output,
+        "localVolume": s.local_volume,
+        "localError": s.local_error,
     });
     let text = st.to_string();
     if text != s.last_panel_json {
@@ -810,6 +853,16 @@ fn write_panel_state(s: &mut State) {
 fn config_f64(key: &str, default: f64) -> f64 {
     let raw = abi::get_config(key);
     serde_json::from_str::<f64>(&raw).unwrap_or(default)
+}
+
+fn config_bool(key: &str, default: bool) -> bool {
+    let raw = abi::get_config(key);
+    serde_json::from_str::<bool>(&raw).unwrap_or(default)
+}
+
+fn config_string(key: &str, default: &str) -> String {
+    let raw = abi::get_config(key);
+    serde_json::from_str::<String>(&raw).unwrap_or_else(|_| default.to_string())
 }
 
 /// Label overrides from `config.sounds`: accepts `[{id,label}]` entries
@@ -837,13 +890,52 @@ fn label_map_from_config() -> std::collections::HashMap<String, String> {
     map
 }
 
-/// Re-read mutable config (master volume, labels). Called on
-/// `config:changed`, `ui:apply` and periodically from the watchdog.
+/// Re-read mutable config (master volume, local output, sounds dir, labels).
+/// Called on `config:changed`, `ui:apply` and periodically from the watchdog.
+/// All device/file work is handed to the decode worker — this stays fast.
 fn apply_config(s: &mut State) {
     let mv = config_f64("masterVolume", 1.0).clamp(0.0, 2.0);
     if (mv - s.master_volume).abs() > 1e-6 {
         s.master_volume = mv;
         mixer::set_master_gain(mv as f32);
+    }
+    let lv = config_f64("localVolume", 1.0).clamp(0.0, 2.0);
+    if (lv - s.local_volume).abs() > 1e-6 {
+        s.local_volume = lv;
+        monitor::set_local_gain(lv);
+    }
+    let lo = config_bool("localOutput", true);
+    if lo != s.local_output {
+        s.local_output = lo;
+        if let Some(w) = s.worker.as_ref() {
+            w.submit(Job::LocalSet(lo));
+        }
+        abi::log_info(&format!(
+            "local headphone output {}",
+            if lo { "enabled" } else { "disabled" }
+        ));
+    }
+    let dir_cfg = config_string("soundsDir", "");
+    if dir_cfg.trim() != s.sounds_dir_cfg.trim() {
+        s.sounds_dir_cfg = dir_cfg.clone();
+        let custom = !dir_cfg.trim().is_empty();
+        let new_dir = if custom {
+            PathBuf::from(dir_cfg.trim())
+        } else {
+            let base = abi::plugin_dir();
+            if base.is_empty() {
+                s.sounds_dir.clone()
+            } else {
+                PathBuf::from(base).join("sounds")
+            }
+        };
+        if new_dir != s.sounds_dir {
+            s.sounds_dir = new_dir.clone();
+            abi::log_info(&format!("sounds directory → {}", new_dir.display()));
+            if let Some(w) = s.worker.as_ref() {
+                w.submit(Job::Rescan(new_dir));
+            }
+        }
     }
     if let Some(w) = s.worker.as_ref() {
         w.set_labels(label_map_from_config());

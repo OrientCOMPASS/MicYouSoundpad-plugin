@@ -2,10 +2,10 @@
   "id": "opss.soundpad",
   "name": "Soundpad",
   "version": "1.0.0",
-  "description": "Phone-controlled soundpad: play sounds (WAV / MP3 / FLAC / OGG / M4A) from the plugin's sounds/ directory, mixed into the MicYou mic stream. Multi-voice, with per-session volume / seek / loop driven from the MicYou Android app.",
+  "description": "Phone-controlled soundpad: play sounds (WAV / MP3 / FLAC / OGG / M4A) from a customizable sounds directory, mixed into the MicYou mic stream. Multi-voice, with per-session volume / seek / loop driven from the MicYou Android app, plus optional local headphone playback independent of the host monitor.",
   "descriptionI18n": {
-    "zh": "手机遥控音效板：播放插件 sounds/ 目录中的音效（WAV/MP3/FLAC/OGG/M4A）并混入 MicYou 麦克风流。支持多音效同时播放，安卓端可控制每条播放的进度、音量与循环。",
-    "zh-CN": "手机遥控音效板：播放插件 sounds/ 目录中的音效（WAV/MP3/FLAC/OGG/M4A）并混入 MicYou 麦克风流。支持多音效同时播放，安卓端可控制每条播放的进度、音量与循环。"
+    "zh": "手机遥控音效板：播放自定义音效目录中的音频（WAV/MP3/FLAC/OGG/M4A）并混入 MicYou 麦克风流。支持多音效同时播放，安卓端可控制每条播放的进度、音量与循环；可选本地耳机直接出声（无需打开宿主监听）。",
+    "zh-CN": "手机遥控音效板：播放自定义音效目录中的音频（WAV/MP3/FLAC/OGG/M4A）并混入 MicYou 麦克风流。支持多音效同时播放，安卓端可控制每条播放的进度、音量与循环；可选本地耳机直接出声（无需打开宿主监听）。"
   },
   "nameI18n": {
     "zh": "音效板",
@@ -59,12 +59,18 @@
   ],
   "config": {
     "masterVolume": 1.0,
+    "localOutput": true,
+    "localVolume": 1.0,
+    "soundsDir": "",
     "sounds": [],
     "sp_state": {
       "sessions": [],
       "sounds": [],
       "lastError": "",
-      "masterVolume": 1.0
+      "masterVolume": 1.0,
+      "localOutput": true,
+      "localVolume": 1.0,
+      "localError": ""
     }
   },
   "configSchema": {
@@ -73,11 +79,35 @@
         "key": "masterVolume",
         "fieldType": "number",
         "label": "主音量 Master Volume",
-        "description": "所有音效混入麦克风时的总增益（0.0 - 2.0，1.0 = 原始音量）。",
+        "description": "音效混入麦克风流（对方听到）的总增益（0.0 - 2.0，1.0 = 原始音量）。",
         "min": 0,
         "max": 2,
         "step": 0.05,
         "default": 1.0
+      },
+      {
+        "key": "localOutput",
+        "fieldType": "boolean",
+        "label": "播放到耳机 Local Headphone Output",
+        "description": "在本机默认输出设备直接播放音效（无需打开宿主监听/耳返；不会回放自己的麦克风）。未串流时也可本地试听。",
+        "default": true
+      },
+      {
+        "key": "localVolume",
+        "fieldType": "number",
+        "label": "耳机音量 Local Volume",
+        "description": "本地耳机输出的独立增益（0.0 - 2.0），与主音量互不影响。",
+        "min": 0,
+        "max": 2,
+        "step": 0.05,
+        "default": 1.0
+      },
+      {
+        "key": "soundsDir",
+        "fieldType": "string",
+        "label": "音效目录 Sounds Directory",
+        "description": "自定义音效库目录（绝对路径）。留空 = 插件目录下的 sounds/。修改后约 2 秒内生效并同步到手机端。",
+        "default": ""
       }
     ]
   },

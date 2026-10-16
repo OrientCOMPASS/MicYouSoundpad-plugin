@@ -79,6 +79,14 @@
     font-size: 11px; padding: 1px 8px; border-radius: 999px;
     border: 1px solid hsl(var(--outline)); color: hsl(var(--on-surface-variant));
   }
+  .switch { display: flex; align-items: center; gap: 8px; }
+  .switch input { accent-color: hsl(var(--primary)); width: 16px; height: 16px; }
+  input[type=text] {
+    flex: 1; min-width: 0; padding: 7px 10px; border-radius: 10px;
+    border: 1px solid hsl(var(--outline)); background: hsl(var(--surface));
+    color: hsl(var(--on-surface)); font-size: 12.5px;
+    font-family: ui-monospace, Consolas, monospace;
+  }
 </style>
 </head>
 <body>
@@ -110,7 +118,21 @@
       <input type="range" id="master" min="0" max="2" step="0.05" value="1" />
       <span class="val" id="masterVal">100%</span>
     </div>
+    <div class="row switch">
+      <input type="checkbox" id="localChk" checked />
+      <label for="localChk" id="localLabel" style="min-width:0"></label>
+      <span style="flex:1"></span>
+      <label id="localVolLabel" style="min-width:0"></label>
+      <input type="range" id="localVol" min="0" max="2" step="0.05" value="1" style="max-width:160px" />
+      <span class="val" id="localVolVal">100%</span>
+    </div>
+    <div class="row">
+      <label id="dirLabel"></label>
+      <input type="text" id="dirInput" placeholder="" />
+      <button id="dirApply"></button>
+    </div>
     <div class="hint" id="dirHint"></div>
+    <div class="err" id="localErrBox"></div>
   </div>
 
 <script>
@@ -138,6 +160,10 @@ const T = {
     master: '主音量', dir: '音效目录：',
     peer: '手机已连接', errPrefix: '错误：',
     loading: '解码中…',
+    local: '播放到耳机（无需打开监听）', localVol: '耳机音量',
+    dirLabel: '自定义目录', dirApply: '应用',
+    dirPlaceholder: '留空 = 插件目录/sounds（绝对路径）',
+    dirHint: '当前目录：', localErrPrefix: '耳机输出不可用：',
   },
   en: {
     sub: 'Phone-remoteable soundpad: plays sounds into the mic stream (peers and your monitor hear them). Drop audio files (WAV/MP3/FLAC/OGG/M4A) into the plugin\u2019s sounds/ folder to list them here and on the phone.',
@@ -148,10 +174,15 @@ const T = {
     master: 'Master volume', dir: 'Sounds folder: ',
     peer: 'phone connected', errPrefix: 'Error: ',
     loading: 'decoding\u2026',
+    local: 'Play to headphones (no monitor needed)', localVol: 'Local volume',
+    dirLabel: 'Custom folder', dirApply: 'Apply',
+    dirPlaceholder: 'empty = <plugin dir>/sounds (absolute path)',
+    dirHint: 'Current folder: ', localErrPrefix: 'Headphone output unavailable: ',
   },
 };
 let t = T['zh-CN'];
 const $ = (id) => document.getElementById(id);
+let lastLocalVol = 1;
 
 function fmtTime(ms) {
   if (!ms || ms < 0) ms = 0;
@@ -214,7 +245,7 @@ function render(cfg) {
   $('noSounds').style.display = sounds.length ? 'none' : 'block';
   $('noSounds').textContent = t.noSounds;
 
-  if (st.soundsDir) $('dirHint').innerHTML = t.dir + '<code></code>';
+  if (st.soundsDir) $('dirHint').innerHTML = t.dirHint + '<code></code>';
   if (st.soundsDir) $('dirHint').querySelector('code').textContent = st.soundsDir;
 
   if (typeof st.masterVolume === 'number' && Math.abs(st.masterVolume - lastMaster) > 1e-6 && !$('master').matches(':active')) {
@@ -222,6 +253,20 @@ function render(cfg) {
   }
   lastMaster = Number($('master').value);
   $('masterVal').textContent = Math.round(lastMaster * 100) + '%';
+
+  if (typeof st.localOutput === 'boolean') $('localChk').checked = st.localOutput;
+  if (typeof st.localVolume === 'number' && Math.abs(st.localVolume - lastLocalVol) > 1e-6 && !$('localVol').matches(':active')) {
+    $('localVol').value = st.localVolume;
+  }
+  lastLocalVol = Number($('localVol').value);
+  $('localVolVal').textContent = Math.round(lastLocalVol * 100) + '%';
+  if (!$('dirInput').matches(':focus')) {
+    $('dirInput').value = (cfg && typeof cfg.soundsDir === 'string') ? cfg.soundsDir : '';
+  }
+
+  const lerr = st.localError || '';
+  $('localErrBox').style.display = lerr ? 'block' : 'none';
+  if (lerr) $('localErrBox').textContent = t.localErrPrefix + lerr;
 }
 
 async function trigger(action, payload) {
@@ -237,6 +282,11 @@ function applyTexts() {
   $('soundsTitle').textContent = t.sounds;
   $('rescanBtn').textContent = t.rescan;
   $('masterLabel').textContent = t.master;
+  $('localLabel').textContent = t.local;
+  $('localVolLabel').textContent = t.localVol;
+  $('dirLabel').textContent = t.dirLabel;
+  $('dirApply').textContent = t.dirApply;
+  $('dirInput').placeholder = t.dirPlaceholder;
 }
 
 async function refresh() {
@@ -259,6 +309,33 @@ $('master').addEventListener('change', async () => {
 });
 $('stopAllBtn').addEventListener('click', () => trigger('stop', {}));
 $('rescanBtn').addEventListener('click', () => trigger('rescan', {}));
+
+$('localVol').addEventListener('input', () => {
+  $('localVolVal').textContent = Math.round(Number($('localVol').value) * 100) + '%';
+  lastLocalVol = Number($('localVol').value);
+});
+$('localVol').addEventListener('change', async () => {
+  const v = Number($('localVol').value);
+  try {
+    await call('set_config', { key: 'localVolume', value: v });
+    await call('trigger', { action: 'apply' });
+  } catch (e) { console.warn(e); }
+});
+$('localChk').addEventListener('change', async () => {
+  try {
+    await call('set_config', { key: 'localOutput', value: $('localChk').checked });
+    await call('trigger', { action: 'apply' });
+  } catch (e) { console.warn(e); }
+  setTimeout(refresh, 300);
+});
+$('dirApply').addEventListener('click', async () => {
+  const v = $('dirInput').value.trim();
+  try {
+    await call('set_config', { key: 'soundsDir', value: v });
+    await call('trigger', { action: 'apply' });
+  } catch (e) { console.warn(e); }
+  setTimeout(refresh, 600);
+});
 
 (async function init() {
   try {

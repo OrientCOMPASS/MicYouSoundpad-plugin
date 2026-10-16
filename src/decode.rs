@@ -64,8 +64,11 @@ pub enum Job {
         path: PathBuf,
         res: Arc<JobResult>,
     },
-    /// Re-walk the sounds directory (cheap; runs every ~2 s).
-    Rescan,
+    /// Re-walk the given sounds directory (cheap; runs every ~2 s).
+    Rescan(PathBuf),
+    /// Enable/disable the local headphone output stream (device I/O happens
+    /// HERE, on the worker thread — never on the bus thread).
+    LocalSet(bool),
     Shutdown,
 }
 
@@ -342,11 +345,16 @@ fn worker_loop(
     rescan_flag: Arc<AtomicBool>,
     cache_cap_mb: usize,
     stop: Arc<AtomicBool>,
+    local_error: Arc<Mutex<String>>,
 ) {
     let mut cache = TrackCache::new(cache_cap_mb);
     let mut last_rescan = std::time::Instant::now()
         .checked_sub(Duration::from_secs(3600))
         .unwrap_or_else(std::time::Instant::now);
+    let mut cur_dir = sounds_dir;
+    // Local headphone output (worker-owned: every device call happens here).
+    let mut local: Option<crate::monitor::LocalOut> = None;
+    let mut local_idle_since: Option<std::time::Instant> = None;
     loop {
         if stop.load(Ordering::Acquire) {
             break;
@@ -365,8 +373,24 @@ fn worker_loop(
                         .lock()
                         .map(|m| m.clone())
                         .unwrap_or_else(|p| p.into_inner().clone());
-                    let fresh = scan_sounds(&sounds_dir, &labels);
+                    let fresh = scan_sounds(&cur_dir, &labels);
                     registry.replace(fresh);
+                }
+                // Local-output play/pause gate with idle hysteresis.
+                if let Some(out) = local.as_mut() {
+                    if crate::monitor::wanted() {
+                        local_idle_since = None;
+                        out.set_playing(true);
+                    } else {
+                        match local_idle_since {
+                            None => local_idle_since = Some(std::time::Instant::now()),
+                            Some(t) => {
+                                if t.elapsed() >= crate::monitor::IDLE_PAUSE {
+                                    out.set_playing(false);
+                                }
+                            }
+                        }
+                    }
                 }
                 continue;
             }
@@ -374,12 +398,41 @@ fn worker_loop(
         };
         match job {
             Job::Shutdown => break,
-            Job::Rescan => {
+            Job::LocalSet(enable) => {
+                if enable {
+                    if local.is_none() {
+                        match crate::monitor::LocalOut::build() {
+                            Ok(out) => {
+                                crate::sptrace!("worker: local output opened");
+                                if let Ok(mut e) = local_error.lock() {
+                                    e.clear();
+                                }
+                                local = Some(out);
+                                local_idle_since = None;
+                            }
+                            Err(err) => {
+                                crate::sptrace!("worker: local output failed: {err}");
+                                if let Ok(mut e) = local_error.lock() {
+                                    *e = err;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    local = None; // Drop closes the device + disarms the tap
+                    local_idle_since = None;
+                    if let Ok(mut e) = local_error.lock() {
+                        e.clear();
+                    }
+                }
+            }
+            Job::Rescan(dir) => {
+                cur_dir = dir;
                 let labels = labels
                     .lock()
                     .map(|m| m.clone())
                     .unwrap_or_else(|p| p.into_inner().clone());
-                let fresh = scan_sounds(&sounds_dir, &labels);
+                let fresh = scan_sounds(&cur_dir, &labels);
                 registry.replace(fresh);
                 last_rescan = std::time::Instant::now();
             }
@@ -420,6 +473,8 @@ pub struct DecodeWorker {
     pub registry: Arc<SoundRegistry>,
     pub rescan_flag: Arc<AtomicBool>,
     pub labels: Arc<Mutex<HashMap<String, String>>>,
+    /// Last local-output open failure (worker writes, bus reads for sp_state).
+    pub local_error: Arc<Mutex<String>>,
 }
 
 impl DecodeWorker {
@@ -429,15 +484,26 @@ impl DecodeWorker {
         let labels: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
         let rescan_flag = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
+        let local_error = Arc::new(Mutex::new(String::new()));
         let handle = {
             let registry = registry.clone();
             let labels = labels.clone();
             let rescan_flag = rescan_flag.clone();
             let stop = stop.clone();
+            let local_error = local_error.clone();
             std::thread::Builder::new()
                 .name("soundpad-decode".into())
                 .spawn(move || {
-                    worker_loop(rx, registry, sounds_dir, labels, rescan_flag, cache_cap_mb, stop)
+                    worker_loop(
+                        rx,
+                        registry,
+                        sounds_dir,
+                        labels,
+                        rescan_flag,
+                        cache_cap_mb,
+                        stop,
+                        local_error,
+                    )
                 })
                 .ok()
         };
@@ -448,6 +514,7 @@ impl DecodeWorker {
             registry,
             rescan_flag,
             labels,
+            local_error,
         }
     }
 
@@ -645,7 +712,7 @@ mod tests {
         generate_demo_sounds(&dir).unwrap();
         let worker = DecodeWorker::spawn(dir.clone(), 64);
         let list = {
-            worker.submit(Job::Rescan);
+            worker.submit(Job::Rescan(dir.clone()));
             // Wait for the registry to fill (worker is idle-polling at 200 ms).
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {

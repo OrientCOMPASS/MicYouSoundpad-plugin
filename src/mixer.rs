@@ -6,6 +6,20 @@
 //! | bus thread (`handle_message`, watchdog tick) | `reserve`, `begin_stop`, `set_gain`, `set_loop`, `set_pos`, `snapshot`, `reclaim` |
 //! | decode worker thread | `publish` (LOADING → ACTIVE), `fail` (LOADING → EMPTY) |
 //! | host real-time audio thread | `process_slice` only: reads state/track/pos/gain, advances pos, fades env, frees nothing |
+//! | local-output (cpal) callback thread | `render_local_mono` — ONLY while the host chain is provably
+//!   inactive (`host_mix_frames()` frozen for > 150 ms), so exactly one
+//!   renderer ever advances positions/envelopes at a time |
+//!
+//! Two render paths share the same slot machine:
+//! * **Host path** ([`process_slice`]): voices are rendered into a static
+//!   scratch buffer with per-session gains, scaled by the master gain into
+//!   the mic frame, and — when the local-output tap is armed — the
+//!   pre-master mono mixdown is pushed into [`tap_ring`] for the headphones
+//!   stream (see `monitor.rs`).
+//! * **Local path** ([`render_local_mono`]): used by the cpal callback when
+//!   MicYou is NOT streaming (host audio thread idle), so pad sounds remain
+//!   audible for offline preview. Applies no master gain (the monitor module
+//!   scales by its own local volume).
 //!
 //! Memory discipline: decoded [`Track`]s travel as `Box<Arc<Track>>` leaked
 //! into the slot's atomic pointer while the slot is live. Only the bus thread
@@ -18,9 +32,10 @@
 //! Envelope: every start/stop/natural-end ramps over [`FADE_SAMPLES`]
 //! (10 ms @ 48 kHz) — click-free even when many voices overlap.
 
-use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+use crate::ring::AudioRing;
 
 /// Host DSP chain runs at a fixed 48 kHz (micyou-plugin `PluginDspBridge`).
 pub const TARGET_RATE: u32 = 48_000;
@@ -66,13 +81,14 @@ pub struct Slot {
     cancel: AtomicBool,
     /// Session id for diagnostics (bus-owned; audio never reads it).
     sid: AtomicU32,
-    /// Fade envelope — owned exclusively by the host real-time audio thread
-    /// (process() is serialized on a single thread), hence UnsafeCell is sound.
-    env: UnsafeCell<f32>,
+    /// Fade envelope as f32 bits. Written only by the ACTIVE renderer (host
+    /// audio thread, or the local-output callback while the host chain is
+    /// provably idle — see the module docs); atomic so the ownership handoff
+    /// can never tear.
+    env: AtomicU32,
 }
 
-// SAFETY: every field is either an atomic or (for `env`) exclusively owned by
-// the single host audio thread, as documented above.
+// SAFETY: every field is an atomic.
 unsafe impl Sync for Slot {}
 
 impl Slot {
@@ -86,7 +102,7 @@ impl Slot {
             looping: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
             sid: AtomicU32::new(0),
-            env: UnsafeCell::new(0.0),
+            env: AtomicU32::new(0),
         }
     }
 
@@ -123,13 +139,14 @@ pub fn set_master_gain(g: f32) {
 /// have reclaimed (or intentionally leaked) any live tracks — `deinit` uses
 /// [`reclaim_all`].
 pub unsafe fn reset_all() {
+    arm_scratch();
     for s in SLOTS.iter() {
         s.state.store(ST_EMPTY, Ordering::Relaxed);
         s.pos.store(0, Ordering::Relaxed);
         s.len.store(0, Ordering::Relaxed);
         s.cancel.store(false, Ordering::Relaxed);
         s.sid.store(0, Ordering::Relaxed);
-        unsafe { *s.env.get() = 0.0 };
+        s.env.store(0, Ordering::Relaxed);
     }
 }
 
@@ -268,29 +285,95 @@ pub fn fail(i: usize) {
 
 // ─────────────────────── audio-thread mix (real-time) ─────────────────────
 
-/// Mix every live voice into `data` (`frames * channels` interleaved f32).
-/// Allocation-free, lock-free, bounded: ≤ SLOT_COUNT atomic loads per slot
-/// plus one FMA-scale pass per live voice.
-///
-/// # Safety contract (callers of the FFI entry)
-/// Runs exclusively on the host real-time audio thread; `data` spans
-/// `frames * channels` writable f32s.
-pub fn process_slice(data: &mut [f32], channels: usize) -> bool {
+/// Max frames per scratch render pass (covers every realistic host frame
+/// size; longer calls are chunked).
+const MAX_SCRATCH_FRAMES: usize = 8192;
+/// Local-output tap: ~0.34 s of mono 48 kHz (power of two).
+const TAP_CAP: usize = 16_384;
+/// Consumer-side latency clamp for the tap ring (100 ms @ 48 kHz).
+pub const TAP_BACKLOG: usize = 4_800;
+
+/// Scratch render buffer — exclusive to the host real-time audio thread
+/// (`process_slice` is serialized on a single thread). Sized by
+/// [`arm_scratch`] during init/deinit (never on the audio thread).
+/// Layout: `[0 .. MAX*2)` stereo render area, `[MAX*2 .. MAX*3)` mono tap
+/// downmix area.
+struct Scratch(std::cell::UnsafeCell<Vec<f32>>);
+// SAFETY: single-thread (audio) ownership documented above.
+unsafe impl Sync for Scratch {}
+static SCRATCH: Scratch = Scratch(std::cell::UnsafeCell::new(Vec::new()));
+
+/// Pre-master mono mixdown handed to the local-output (headphones) stream.
+static TAP: OnceLock<AudioRing> = OnceLock::new();
+/// Armed while the local-output stream exists (monitor.rs owns the flag).
+static TAP_ON: AtomicBool = AtomicBool::new(false);
+/// Liveness beacon: total frames mixed by the HOST audio thread. The local
+/// output gate watches this freeze to decide when it may self-render.
+static HOST_MIX_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// Size the audio-thread scratch (init/deinit only — no concurrent render).
+pub fn arm_scratch() {
+    let s = unsafe { &mut *SCRATCH.0.get() };
+    let need = MAX_SCRATCH_FRAMES * 3;
+    if s.len() < need {
+        s.resize(need, 0.0);
+    }
+}
+
+pub fn tap_arm() {
+    let r = TAP.get_or_init(|| AudioRing::new(TAP_CAP));
+    r.clear();
+    TAP_ON.store(true, Ordering::Release);
+}
+
+pub fn tap_disarm() {
+    TAP_ON.store(false, Ordering::Release);
+}
+
+/// The tap ring, when armed (host audio thread producer side).
+fn tap_ring() -> Option<&'static AudioRing> {
+    if TAP_ON.load(Ordering::Acquire) {
+        TAP.get()
+    } else {
+        None
+    }
+}
+
+/// The tap ring regardless of arming (local-output consumer side), plus the
+/// consumer's ability to clear it on mode transitions.
+pub fn tap() -> Option<&'static AudioRing> {
+    TAP.get()
+}
+
+/// Frames mixed by the host audio thread so far (liveness beacon).
+pub fn host_mix_frames() -> u64 {
+    HOST_MIX_FRAMES.load(Ordering::Relaxed)
+}
+
+/// True when any slot holds a live (mixing or fading) voice.
+fn any_live() -> bool {
+    SLOTS.iter().any(|s| {
+        let st = s.state.load(Ordering::Acquire);
+        st == ST_ACTIVE || st == ST_STOPPING
+    })
+}
+
+/// Core voice renderer: mix every live slot into `data` (`frames * channels`
+/// interleaved f32) with per-session gains (NO master/local scaling — the
+/// calling path applies its own output gain). Advances positions and fades
+/// envelopes; allocation-free, lock-free, bounded.
+fn mix_voices(data: &mut [f32], channels: usize) -> bool {
     let frames = data.len() / channels.max(1);
     if frames == 0 {
         return false;
     }
-    let master = f32::from_bits(MASTER_BITS.load(Ordering::Relaxed));
-    let step = 1.0 / FADE_SAMPLES;
     let mut any = false;
 
     for s in SLOTS.iter() {
-        // SAFETY: `env` is audio-thread-exclusive (single serialized thread).
-        let env_ptr = s.env.get();
         let st = s.state.load(Ordering::Acquire);
         if st == ST_EMPTY {
-            if unsafe { *env_ptr } != 0.0 {
-                unsafe { *env_ptr = 0.0 };
+            if s.env.load(Ordering::Relaxed) != 0 {
+                s.env.store(0, Ordering::Relaxed);
             }
             continue;
         }
@@ -301,12 +384,13 @@ pub fn process_slice(data: &mut [f32], channels: usize) -> bool {
         let track = unsafe { &*s.track.load(Ordering::Relaxed) }; // valid: state ≥ ACTIVE
         let tf = track.frames;
         let tch = track.channels.max(1);
-        let gain = f32::from_bits(s.gain.load(Ordering::Relaxed)) * master;
+        let gain = f32::from_bits(s.gain.load(Ordering::Relaxed));
         let looping = s.looping.load(Ordering::Relaxed);
         let mut pos = s.pos.load(Ordering::Relaxed) as usize;
-        let mut env = unsafe { *env_ptr };
+        let mut env = f32::from_bits(s.env.load(Ordering::Relaxed));
         let mut target = if st == ST_ACTIVE { 1.0 } else { 0.0 };
         let mut ended = false;
+        let step = 1.0 / FADE_SAMPLES;
 
         for fi in 0..frames {
             // Envelope ramp (per sample, like Focus-Capture's mix callback).
@@ -332,7 +416,7 @@ pub fn process_slice(data: &mut [f32], channels: usize) -> bool {
                     pos %= tf;
                 } else {
                     // Natural end: fade out from here (state flip is seen by
-                    // the watchdog; audio keeps the envelope math local).
+                    // the watchdog; the renderer keeps envelope math local).
                     target = 0.0;
                     ended = true;
                     if env <= 0.0 {
@@ -377,7 +461,7 @@ pub fn process_slice(data: &mut [f32], channels: usize) -> bool {
         }
 
         s.pos.store(pos as u64, Ordering::Relaxed);
-        unsafe { *env_ptr = env };
+        s.env.store(env.to_bits(), Ordering::Relaxed);
         if ended || target == 0.0 {
             if env <= 0.0 {
                 // Last operation on the slot: Release pairs with the bus
@@ -389,6 +473,85 @@ pub fn process_slice(data: &mut [f32], channels: usize) -> bool {
         }
     }
     any
+}
+
+/// HOST real-time path: render all voices with the master gain into the mic
+/// frame, and feed the pre-master mono mixdown to the local-output tap.
+/// Allocation-free (static scratch), lock-free, bounded.
+///
+/// # Safety contract (FFI callers)
+/// Runs exclusively on the host real-time audio thread; `data` spans
+/// `frames * channels` writable interleaved f32s.
+pub fn process_slice(data: &mut [f32], channels: usize) -> bool {
+    let channels = channels.max(1);
+    let frames = data.len() / channels;
+    if frames == 0 {
+        return false;
+    }
+    // Liveness beacon first: even a fully bypassed frame proves the host
+    // audio thread is running (the local-output gate depends on it).
+    HOST_MIX_FRAMES.fetch_add(frames as u64, Ordering::Relaxed);
+    if !any_live() {
+        return false;
+    }
+    let scratch = unsafe { &mut *SCRATCH.0.get() };
+    if scratch.len() < MAX_SCRATCH_FRAMES * 3 {
+        // arm_scratch() never ran (init contract broken) — fail silent-safe.
+        return false;
+    }
+    let master = f32::from_bits(MASTER_BITS.load(Ordering::Relaxed));
+    let render_ch = channels.min(2);
+    let mono_off = MAX_SCRATCH_FRAMES * 2;
+
+    for chunk_start in (0..frames).step_by(MAX_SCRATCH_FRAMES) {
+        let n = (frames - chunk_start).min(MAX_SCRATCH_FRAMES);
+        let (render_area, rest) = scratch.split_at_mut(n * render_ch);
+        render_area.fill(0.0);
+        mix_voices(render_area, render_ch);
+
+        // Tap: pre-master mono mixdown for the headphones stream.
+        if let Some(ring) = tap_ring() {
+            if render_ch == 1 {
+                ring.push(render_area);
+            } else {
+                let mono = &mut rest[mono_off - n * render_ch..][..n];
+                for fi in 0..n {
+                    mono[fi] = (render_area[fi * 2] + render_area[fi * 2 + 1]) * 0.5;
+                }
+                ring.push(mono);
+            }
+        }
+
+        // Expand-add into the mic frame with the master gain.
+        let dst = &mut data[chunk_start * channels..(chunk_start + n) * channels];
+        if channels == render_ch {
+            for i in 0..n * render_ch {
+                dst[i] += render_area[i] * master;
+            }
+        } else {
+            // channels > 2: L/R to the front pair, mono to the rest.
+            for fi in 0..n {
+                let l = render_area[fi * 2] * master;
+                let r = render_area[fi * 2 + 1] * master;
+                let base = fi * channels;
+                dst[base] += l;
+                dst[base + 1] += r;
+                let m = (l + r) * 0.5;
+                for c in 2..channels {
+                    dst[base + c] += m;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// LOCAL real-time path (cpal callback, host chain provably idle): render
+/// all voices into a mono buffer WITHOUT master gain — the monitor module
+/// applies its own local volume. Same slot machine, same advancement rules;
+/// the temporal gate (see module docs) guarantees a single active renderer.
+pub fn render_local_mono(out: &mut [f32]) -> bool {
+    mix_voices(out, 1)
 }
 
 #[cfg(test)]
@@ -408,6 +571,7 @@ pub(crate) mod tests {
         // Wipe any leaked voices from a panicked test so failures never
         // cascade (the audio thread is not running under tests, so
         // reclaim_all's force-park is sound here).
+        arm_scratch();
         reclaim_all();
         set_master_gain(1.0);
         g
@@ -639,6 +803,28 @@ pub(crate) mod tests {
         );
         drain(9, 4);
         drain(8, 4);
+    }
+
+    #[test]
+    fn local_render_advances_without_host_beacon() {
+        let _g = lock();
+        let i = 10;
+        start(i, 21, sine_track(48000, 1), 1.0, false);
+        let before = host_mix_frames();
+        let mut buf = vec![0.0f32; 480];
+        assert!(render_local_mono(&mut buf));
+        assert_eq!(host_mix_frames(), before, "local path must not feed the beacon");
+        assert!(rms(&buf[64..]) > 0.05, "local render silent");
+        let pos = slot(i).position_frames();
+        assert!((1..=480).contains(&pos), "pos {pos}");
+        // Stop + park through the local path as well.
+        begin_stop(i);
+        for _ in 0..4 {
+            let mut b = vec![0.0f32; 480];
+            render_local_mono(&mut b);
+        }
+        assert_eq!(slot(i).state(), ST_EMPTY);
+        reclaim(i);
     }
 
     #[test]
