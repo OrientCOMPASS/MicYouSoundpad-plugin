@@ -18,10 +18,10 @@ MicYou 宿主的跨设备插件消息（`docs/plugins/api-reference.md` §跨端
 |---|---|---|
 | `hello` | `req`, `client?`, `clientVersion?` | 发现 + 保活。桌面回 `hello`（含音效列表与会话快照）。手机连接期间周期发送：未回包 → 隐藏 SoundPad 按钮 |
 | `list` | `req` | 请求音效列表（同时触发目录重扫；重扫结果经 `list` 推送） |
-| `play` | `req`, `id`, `volume?`(0–2, 默认 1), `loop?`(默认 false) | 播放音效。立即回 `play`（会话 phase=`loading`），解码完成后推 `state`（phase=`playing`） |
+| `play` | `req`, `id`, `volume?`(0–2), `loop?`(默认 false) | 播放音效。**`volume` 缺省 = 使用该音效的记忆音量**（桌面端按音效 id 持久化于 `soundVolumes` 配置；显式携带时同时更新记忆）。立即回 `play`（会话 phase=`loading`，volume=实际生效值），解码完成后推 `state`（phase=`playing`） |
 | `stop` | `req`, `sessionId?` | 停止指定会话；缺省 `sessionId` = 全部停止。回 `stop` + 推 `state` |
 | `seek` | `req`, `sessionId`, `positionMs` | 跳转进度（自动夹取到音轨内）。回 `ok` + 推 `state` |
-| `volume` | `req`, `sessionId`, `volume`(0–2) | 会话音量。回 `ok` + 推 `state` |
+| `volume` | `req`, `sessionId`, `volume`(0–2) | 会话音量，**并按音效 id 写入记忆**（该音效下次播放的默认音量）。回 `ok` + 推 `state` |
 | `loop` | `req`, `sessionId`, `loop`(bool) | 会话循环开关。回 `ok` + 推 `state` |
 | `state` | `req` | 请求会话快照。回 `state` |
 
@@ -39,8 +39,10 @@ MicYou 宿主的跨设备插件消息（`docs/plugins/api-reference.md` §跨端
 ### `sounds[]` 条目
 
 ```json
-{ "id": "laugh", "label": "大笑", "durationMs": 2350 }
+{ "id": "memes/laugh", "label": "大笑", "durationMs": 2350, "dir": "memes" }
 ```
+
+音效库支持**子文件夹分类**（递归扫描，深度 ≤ 8、条目 ≤ 4096）：`id` = 相对音效根目录的无扩展名路径（`/` 分隔），`dir` = 相对文件夹（根目录为 `""`）。手机端据 `dir` 构建文件夹导航；同一文件夹内同主干名冲突（laugh.wav + laugh.mp3）按文件名序取先者。
 
 `durationMs` 来自容器元数据探测（WAV 头 / MP3 Xing / FLAC STREAMINFO / OGG granule / M4A）；`0` 表示暂不可知（播放开始后由轨道真实长度纠正）。
 

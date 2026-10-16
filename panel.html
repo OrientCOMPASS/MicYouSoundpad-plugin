@@ -97,6 +97,7 @@
     <div class="row" style="margin-top:0">
       <strong id="playingTitle"></strong>
       <span class="badge" id="peerBadge" style="display:none"></span>
+      <span class="badge" id="monitorBadge" style="display:none"></span>
       <span style="flex:1"></span>
       <button class="danger" id="stopAllBtn" disabled></button>
     </div>
@@ -159,7 +160,7 @@ const T = {
     noSounds: '没有音效——把音频文件（WAV/MP3/FLAC/OGG/M4A）放进 sounds/ 目录后点「重新扫描」',
     master: '主音量', dir: '音效目录：',
     peer: '手机已连接', errPrefix: '错误：',
-    loading: '解码中…',
+    loading: '解码中…', monitorOn: '宿主监听中 · 耳机输出已自动暂停',
     local: '播放到耳机（无需打开监听）', localVol: '耳机音量',
     dirLabel: '自定义目录', dirApply: '应用',
     dirPlaceholder: '留空 = 插件目录/sounds（绝对路径）',
@@ -173,7 +174,7 @@ const T = {
     noSounds: 'No sounds \u2014 drop audio files (WAV/MP3/FLAC/OGG/M4A) into the sounds/ folder, then hit Rescan',
     master: 'Master volume', dir: 'Sounds folder: ',
     peer: 'phone connected', errPrefix: 'Error: ',
-    loading: 'decoding\u2026',
+    loading: 'decoding\u2026', monitorOn: 'host monitor on \u00b7 local output auto-paused',
     local: 'Play to headphones (no monitor needed)', localVol: 'Local volume',
     dirLabel: 'Custom folder', dirApply: 'Apply',
     dirPlaceholder: 'empty = <plugin dir>/sounds (absolute path)',
@@ -229,6 +230,10 @@ function render(cfg) {
   $('peerBadge').style.display = peer ? 'inline-block' : 'none';
   $('peerBadge').textContent = '📱 ' + t.peer;
 
+  const mon = !!st.monitorOn && st.localOutput !== false;
+  $('monitorBadge').style.display = mon ? 'inline-block' : 'none';
+  $('monitorBadge').textContent = '🎧 ' + t.monitorOn;
+
   // ── sound grid ──
   $('padGrid').innerHTML = '';
   for (const s of sounds) {
@@ -237,7 +242,8 @@ function render(cfg) {
     div.title = s.id;
     const icon = document.createElement('span'); icon.className = 'icon'; icon.textContent = '🔊';
     const nm = document.createElement('span'); nm.className = 'name'; nm.textContent = s.label || s.id;
-    const dur = document.createElement('span'); dur.className = 'dur'; dur.textContent = fmtTime(s.durationMs);
+    const dur = document.createElement('span'); dur.className = 'dur';
+    dur.textContent = (s.dir ? s.dir + ' · ' : '') + fmtTime(s.durationMs);
     div.append(icon, nm, dur);
     div.addEventListener('click', () => trigger('play', { id: s.id }));
     $('padGrid').appendChild(div);

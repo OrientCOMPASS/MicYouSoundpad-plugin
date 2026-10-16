@@ -11,7 +11,9 @@ MicYou 原生插件 `opss.soundpad` 的实现说明：需求分解、宿主机�
 | 子问题 | 方案 |
 |---|---|
 | 混入麦克风流 | 注册为 DSP 节点（`kind: dsp`，`insertAfter: VAD`，`realtimeSafe: true`），在 `micyou_plugin_process` 中做加性混音。**不用**宿主 `play_sound`：它排队播整只 WAV，无进度/音量/循环/多声部控制 |
-| 本地出声（不开监听） | 自带 cpal 输出流（monitor.rs）：串流中消费实时线程的 tap ring，宿主空闲时自渲染（§5.5） |
+| 本地出声（不开监听） | 自带 cpal 输出流（monitor.rs）：串流中消费实时线程的 tap ring，宿主空闲时自渲染（§5.5）；**宿主监听开启时自动抑制**（v2 API `get_monitoring` + `monitoring_changed` 事件，见 §5.5） |
+| 按音效记忆音量 | `soundVolumes` 配置（id → 音量）：`volume` 命令与显式 `play` 音量写入；`play` 缺省音量时读取 |
+| 文件夹分类 | 递归扫描（深度 ≤8 / ≤4096 文件 / 跳过隐藏项），id = 相对路径；协议 `sounds[].dir` 供手机端导航 |
 | 音效目录自定义 | `soundsDir` 配置热生效：总线线程只做比对，目录重扫在 worker（Job 携带新路径） |
 | 手机发现插件 | 手机经跨设备 `PluginMessage` 发 `hello`；插件回包（含音效列表）即"确定有 soundpad 插件" |
 | 多声部 + 传输控制 | 自研 16 槽位实时混音器（§4），每条播放 = 一个会话 |
@@ -91,6 +93,8 @@ EMPTY ──reserve(总线)──► LOADING ──publish(worker, CAS)──►
 | 设备采样率 ≠ 48k | 回调内 SincResampler + FIFO 平滑（块粒度重采样，稳态零分配） |
 | 设备 I/O 不能在总线线程（实例锁 → 爆音） | Stream 的 open/play/pause/drop 全部由解码 worker 执行：init 经 `Job::LocalSet(true)` 开启（初始 paused）；watchdog 写 `LOCAL_WANTED`（有会话 && localOutput），worker 200ms 房检查带 3s 空闲滞回 play/pause；deinit join worker 时 Drop 关设备 |
 | 无输出设备/打开失败 | worker 写入 `local_error`，watchdog 透出到 `sp_state.localError`（面板显示"耳机输出不可用"），插件其余功能不受影响 |
+
+**宿主监听联动**：宿主耳返开启时处理链（含 pad 混音）已被宿主路由到耳机，本插件再出声即双重播放。init 经 `host_info().apiVersion` 探测 v2（append-only ABI：v1 宿主表可能止于 `set_panel_icon`，越读即 OOB，故 v2 字段全部 `Option<fn>` 且仅在探测通过后触碰）；`get_monitoring()` 取初值 + `monitoring_changed` 事件跟随（需 `control.observe` 能力）；抑制点收敛在 `LOCAL_WANTED` 门（`localOutput ∧ ¬hostMonitoring ∧ 有会话`），worker 滞回逻辑无需感知原因。v1 宿主 → 状态未知 → 不抑制（保持旧行为）。
 
 包络 `env` 因双渲染者改为 `AtomicU32`（f32 bits，每次调用一读一写，非逐样本原子）——门控保证事实单写者，原子性消除理论数据竞争。
 

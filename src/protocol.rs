@@ -44,7 +44,7 @@ pub enum Cmd {
     Hello { req: u64 },
     List { req: u64 },
     State { req: u64 },
-    Play { req: u64, id: String, volume: f64, r#loop: bool },
+    Play { req: u64, id: String, volume: Option<f64>, r#loop: bool },
     Stop { req: u64, session_id: Option<u64> },
     Seek { req: u64, session_id: u64, position_ms: u64 },
     Volume { req: u64, session_id: u64, volume: f64 },
@@ -74,11 +74,8 @@ pub fn parse_cmd(payload: &[u8]) -> Result<Cmd, String> {
             if id.is_empty() || id.len() > 160 {
                 return Err("play: bad id".into());
             }
-            let volume = obj
-                .get("volume")
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0)
-                .clamp(0.0, 2.0);
+            // volume 缺省 = 使用该音效的记忆音量（lib.rs 的 soundVolumes）
+            let volume = obj.get("volume").and_then(Value::as_f64).map(|v| v.clamp(0.0, 2.0));
             let lo = obj.get("loop").and_then(Value::as_bool).unwrap_or(false);
             Ok(Cmd::Play { req, id, volume, r#loop: lo })
         }
@@ -163,8 +160,8 @@ pub fn parse_ui_action(topic: &str, payload: &[u8]) -> UiAction {
 
 // ─────────────────────────── reply builders ───────────────────────────────
 
-pub fn sound_json(id: &str, label: &str, duration_ms: u64) -> Value {
-    json!({ "id": id, "label": label, "durationMs": duration_ms })
+pub fn sound_json(id: &str, label: &str, duration_ms: u64, dir: &str) -> Value {
+    json!({ "id": id, "label": label, "durationMs": duration_ms, "dir": dir })
 }
 
 pub fn session_json(
@@ -236,12 +233,12 @@ mod tests {
         assert_eq!(cmd(r#"{"op":"state","req":1}"#), Cmd::State { req: 1 });
         assert_eq!(
             cmd(r#"{"op":"play","req":2,"id":"beep","volume":0.5,"loop":true}"#),
-            Cmd::Play { req: 2, id: "beep".into(), volume: 0.5, r#loop: true }
+            Cmd::Play { req: 2, id: "beep".into(), volume: Some(0.5), r#loop: true }
         );
-        // play defaults
+        // play defaults: no volume → None (caller resolves the remembered level)
         assert_eq!(
             cmd(r#"{"op":"play","id":"x"}"#),
-            Cmd::Play { req: 0, id: "x".into(), volume: 1.0, r#loop: false }
+            Cmd::Play { req: 0, id: "x".into(), volume: None, r#loop: false }
         );
         assert_eq!(
             cmd(r#"{"op":"stop","req":3,"sessionId":9}"#),
@@ -270,7 +267,7 @@ mod tests {
         );
         assert_eq!(
             cmd(r#"{"op":"play","id":"x","volume":-3}"#),
-            Cmd::Play { req: 0, id: "x".into(), volume: 0.0, r#loop: false }
+            Cmd::Play { req: 0, id: "x".into(), volume: Some(0.0), r#loop: false }
         );
     }
 
@@ -319,11 +316,12 @@ mod tests {
             1,
             "opss.soundpad",
             "1.0.0",
-            vec![sound_json("beep", "Beep", 500)],
+            vec![sound_json("memes/beep", "Beep", 500, "memes")],
             vec![],
         );
         assert_eq!(h["op"], "hello");
         assert_eq!(h["sounds"][0]["durationMs"], 500);
+        assert_eq!(h["sounds"][0]["dir"], "memes");
         let s = session_json(2, "beep", "Beep", "playing", 120, 500, 0.8, true);
         assert_eq!(s["sessionId"], 2);
         assert_eq!(s["phase"], "playing");

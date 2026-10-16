@@ -10,7 +10,7 @@
 | 运行时 | Native（cdylib，C ABI v1 / apiVersion 1） |
 | 平台 | **Windows（x86_64）· Linux（x86_64）· macOS（universal：arm64 + x86_64）**；单包分发，宿主按平台自选 |
 | 插件类型 | `dsp`（实时处理链节点，`realtimeSafe: true`，`insertAfter: VAD`） |
-| 权限 | `dsp.node`、`config.read`、`config.write`、`message.send`、`device.list`（无网络/剪贴板权限） |
+| 权限 | `dsp.node`、`config.read`、`config.write`、`message.send`、`control.observe`（宿主监听状态，用于自动暂停本地出声）、`device.list`（无网络/剪贴板权限） |
 | 音频格式 | WAV · MP3 · FLAC · OGG (Vorbis) · M4A/AAC（纯 Rust 解码，[symphonia](https://github.com/pdeljanov/Symphonia)） |
 | 依赖 | 无外部运行库（纯 Rust + 系统库） |
 | 安卓端 | [OrientCOMPASS/MicYou](https://github.com/OrientCOMPASS/MicYou) `soundpad` 分支（连接桌面端后自动出现 SoundPad 按钮） |
@@ -28,6 +28,7 @@
 ### 音效库
 
 - 音效目录可在插件设置里**自定义**（`soundsDir`，绝对路径；留空 = 插件目录下 `sounds/`），修改约 2 秒内生效并同步到手机端与面板
+- **支持子文件夹分类**：递归扫描（深度 ≤8、≤4096 个文件），手机端面板呈现文件夹导航（进入/返回上级），音效 id = 相对路径（如 `memes/laugh`）
 - 音效 = 音效目录内的音频文件：**WAV**（PCM 8/16/24/32-bit、float 32/64-bit）· **MP3** · **FLAC** · **OGG**(Vorbis) · **M4A/AAC**，任意采样率/声道数，插件内自动重采样到 48 kHz
 - 首次启用时若 `sounds/` 为空，自动生成 3 个演示音效（beep / ding / chime）
 - 增删文件后点面板「重新扫描」（插件每 ~2 秒也会自动扫描一次），手机端音效列表随之更新

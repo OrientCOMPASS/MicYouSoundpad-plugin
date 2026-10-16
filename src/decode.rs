@@ -75,13 +75,17 @@ pub enum Job {
 /// One playable sound known to the pad.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SoundEntry {
-    /// Stable id: the file stem (e.g. `beep` for `sounds/beep.wav`).
+    /// Stable id: the sound-dir-relative path without extension, `/`-joined
+    /// (e.g. `memes/laugh` for `sounds/memes/laugh.mp3`; `beep` at the root).
     pub id: String,
-    /// Display name (config label override, else the id).
+    /// Display name (config label override, else the file stem).
     pub label: String,
-    /// File name relative to the sounds directory (e.g. `beep.wav`).
+    /// File name relative to the sounds directory (e.g. `memes/laugh.mp3`).
     pub file: String,
-    /// Absolute path (resolved by the worker; never leaves the sounds dir).
+    /// Folder relative to the sounds root ("" = root), `/`-joined — the
+    /// phone builds its folder navigation from this.
+    pub dir: String,
+    /// Absolute path (resolved by the worker inside the configured dir).
     pub path: PathBuf,
     pub duration_ms: u64,
 }
@@ -169,50 +173,98 @@ impl TrackCache {
     }
 }
 
-/// Walk the sounds directory and probe every `.wav` (case-insensitive).
-/// `labels` maps sound id → display label (from plugin config).
+/// Recursively walk the sounds directory and probe every supported audio
+/// file. Ids are root-relative paths without extension (`memes/laugh`);
+/// hidden entries (`.`-prefixed) are skipped. Bounded: depth ≤ 8, files ≤
+/// 4096 — a runaway symlink loop or huge tree can not wedge the worker.
+/// `labels` maps sound id (or file stem) → display label (from config).
 pub fn scan_sounds(dir: &Path, labels: &HashMap<String, String>) -> Vec<SoundEntry> {
+    const MAX_DEPTH: usize = 8;
+    const MAX_FILES: usize = 4096;
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in rd.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
-        if !ft.is_file() {
-            continue;
+    // (absolute dir, relative prefix)
+    let mut stack: Vec<(PathBuf, String)> = vec![(dir.to_path_buf(), String::new())];
+    let mut depth_guard: Vec<usize> = vec![0];
+    while let Some((cur, rel)) = stack.pop() {
+        let depth = depth_guard.pop().unwrap_or(0);
+        if out.len() >= MAX_FILES {
+            break;
         }
-        let path = entry.path();
-        if !crate::symph::is_supported(&path) {
+        let Ok(rd) = std::fs::read_dir(&cur) else {
             continue;
+        };
+        let mut subdirs = Vec::new();
+        for entry in rd.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            if ft.is_dir() {
+                if depth + 1 <= MAX_DEPTH {
+                    let child_rel = if rel.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{rel}/{name}")
+                    };
+                    subdirs.push((path, child_rel));
+                }
+                continue;
+            }
+            if !ft.is_file() || out.len() >= MAX_FILES {
+                continue;
+            }
+            if !crate::symph::is_supported(&path) {
+                continue;
+            }
+            let Some(stem) = path.file_stem() else { continue };
+            let stem = stem.to_string_lossy().to_string();
+            if stem.is_empty() || stem.len() > 120 {
+                continue;
+            }
+            let id = if rel.is_empty() {
+                stem.clone()
+            } else {
+                format!("{rel}/{stem}")
+            };
+            // Header/metadata probe only (no audio data read). Undecodable
+            // files are listed with duration 0 so the phone can surface the
+            // error on play.
+            let duration_ms = probe_any(&path).unwrap_or(0);
+            let file = if rel.is_empty() {
+                path.file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            } else {
+                format!(
+                    "{rel}/{}",
+                    path.file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                )
+            };
+            let label = labels
+                .get(&id)
+                .cloned()
+                .or_else(|| labels.get(&stem).cloned())
+                .unwrap_or(stem);
+            out.push(SoundEntry {
+                id,
+                label,
+                file,
+                dir: rel.clone(),
+                path,
+                duration_ms,
+            });
         }
-        let Some(stem) = path.file_stem() else { continue };
-        let id = stem.to_string_lossy().to_string();
-        if id.is_empty() || id.len() > 120 {
-            continue;
+        for (p, r) in subdirs {
+            stack.push((p, r));
+            depth_guard.push(depth + 1);
         }
-        // Header/metadata probe only (no audio data read). Undecodable files
-        // are listed with duration 0 so the phone can surface the error on
-        // play.
-        let duration_ms = probe_any(&path).unwrap_or(0);
-        let file = path
-            .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let label = labels
-            .get(&id)
-            .cloned()
-            .or_else(|| labels.get(&file).cloned())
-            .unwrap_or_else(|| id.clone());
-        out.push(SoundEntry {
-            id,
-            label,
-            file,
-            path,
-            duration_ms,
-        });
     }
-    // Stable, human-friendly order; on id collisions (beep.wav + beep.mp3)
-    // the alphabetically-first file wins deterministically.
+    // Stable, human-friendly order: by folder, then name; on id collisions
+    // (laugh.wav + laugh.mp3) the alphabetically-first file wins.
     out.sort_by(|a, b| {
         a.id
             .to_lowercase()
@@ -589,10 +641,38 @@ mod tests {
         assert_eq!(list.len(), 2);
         let beep = list.iter().find(|s| s.id == "beep").unwrap();
         assert_eq!(beep.label, "Beep Label");
+        assert_eq!(beep.dir, "");
         assert!((beep.duration_ms as i64 - 500).abs() <= 2);
         let loud = list.iter().find(|s| s.id == "LOUD").unwrap();
         assert_eq!(loud.label, "LOUD", "falls back to id without override");
         assert!((loud.duration_ms as i64 - 250).abs() <= 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_walks_subfolders_with_relative_ids() {
+        let dir = tmp_dir("scan-tree");
+        let memes = dir.join("memes");
+        let deep = memes.join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(dir.join(".hidden")).unwrap();
+        write_wav(&dir, "root.wav", 0.3, 44100);
+        write_wav(&memes, "laugh.wav", 0.3, 44100);
+        write_wav(&deep, "horn.mp3-placeholder.wav", 0.3, 44100);
+        write_wav(&dir.join(".hidden"), "secret.wav", 0.3, 44100);
+        // same stem in two folders → distinct ids, no dedup
+        write_wav(&memes, "root.wav", 0.3, 44100);
+        let list = scan_sounds(&dir, &HashMap::new());
+        let ids: Vec<&str> = list.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"root"), "{ids:?}");
+        assert!(ids.contains(&"memes/laugh"), "{ids:?}");
+        assert!(ids.contains(&"memes/root"), "{ids:?}");
+        assert!(ids.contains(&"memes/deep/horn.mp3-placeholder"), "{ids:?}");
+        assert!(!ids.iter().any(|i| i.contains("secret")), "hidden skipped");
+        assert_eq!(list.len(), 4);
+        let memes_laugh = list.iter().find(|e| e.id == "memes/laugh").unwrap();
+        assert_eq!(memes_laugh.dir, "memes");
+        assert_eq!(memes_laugh.file, "memes/laugh.wav");
         std::fs::remove_dir_all(&dir).ok();
     }
 

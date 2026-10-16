@@ -112,6 +112,9 @@ struct State {
     local_volume: f64,
     /// Last local-output device error (surfaced in sp_state for the panel).
     local_error: String,
+    /// Per-sound volume memory (sound id → 0..2), persisted in the
+    /// `soundVolumes` config key. A play without an explicit volume uses it.
+    volumes: std::collections::HashMap<String, f64>,
     /// Last `sp_state` JSON written to config (dedupe: write only on change).
     last_panel_json: String,
     /// Registry version already pushed to the phone (list-change detection).
@@ -134,6 +137,7 @@ impl State {
             local_output: true,
             local_volume: 1.0,
             local_error: String::new(),
+            volumes: std::collections::HashMap::new(),
             last_panel_json: String::new(),
             pushed_registry_version: 0,
         }
@@ -142,6 +146,13 @@ impl State {
         self.sessions.iter().position(|r| r.sid == sid)
     }
 }
+
+/// Host ear-return (监听) state; v2 hosts report it via `get_monitoring` +
+/// `monitoring_changed` events. While ON, the host already routes the chain
+/// (pad mix included) to the user's headphones — our own local output would
+/// double it, so it is auto-suppressed (LOCAL_WANTED gate).
+static HOST_MONITORING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 static STATE: std::sync::LazyLock<Mutex<State>> =
     std::sync::LazyLock::new(|| Mutex::new(State::new()));
@@ -207,12 +218,26 @@ pub unsafe extern "C" fn micyou_plugin_init(host: *const mpl_host_api_t) -> abi:
             ensure_demo_sounds(&s.sounds_dir);
         }
 
+        // Host API v2? Enables monitoring-state observation (auto-suppress
+        // local output while the host ear-return already plays the pad).
+        let v2 = abi::detect_v2();
+        HOST_MONITORING.store(
+            abi::get_monitoring().unwrap_or(false),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        sptrace!("init: host api v2={v2} monitoring={}", HOST_MONITORING.load(std::sync::atomic::Ordering::Relaxed));
+
         // Config: master volume, local headphone output, label overrides.
         s.master_volume = config_f64("masterVolume", 1.0).clamp(0.0, 2.0);
         mixer::set_master_gain(s.master_volume as f32);
         s.local_output = config_bool("localOutput", true);
         s.local_volume = config_f64("localVolume", 1.0).clamp(0.0, 2.0);
         monitor::set_local_gain(s.local_volume);
+        s.volumes = serde_json::from_str(&abi::get_config("soundVolumes"))
+            .unwrap_or_else(|_| serde_json::from_str::<serde_json::Value>("{}")
+                .ok()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default());
         let labels = label_map_from_config();
 
         // Decode worker + initial synchronous scan (init may do file I/O;
@@ -278,6 +303,7 @@ pub extern "C" fn micyou_plugin_deinit() {
         // No concurrent process() is possible once we are out of the DSP
         // chain, so force-reclaiming every slot's track is safe here.
         mixer::reclaim_all();
+        HOST_MONITORING.store(false, std::sync::atomic::Ordering::Relaxed);
         *s = State::new();
         drop(s);
         abi::clear_host();
@@ -331,6 +357,7 @@ pub unsafe extern "C" fn micyou_plugin_handle_event(
     type_name: *const c_char,
     _json: *const c_char,
 ) -> abi::mpl_result_t {
+    // (json parsed per-event below via json_arg)
     guard(|| {
         let t = unsafe { abi::cstr_or(type_name, "") };
         match t {
@@ -345,6 +372,18 @@ pub unsafe extern "C" fn micyou_plugin_handle_event(
             "device_disconnected" => {
                 let mut s = state();
                 s.peer = None;
+            }
+            "monitoring_changed" => {
+                // Payload shapes: {"enabled":b} or the serde enum wrapper
+                // {"MonitoringChanged":{"enabled":b}} — accept both.
+                if let Some(json) = unsafe { json_arg(_json) } {
+                    if let Some(on) = parse_enabled(&json) {
+                        HOST_MONITORING.store(on, std::sync::atomic::Ordering::Relaxed);
+                        let s = state();
+                        update_wanted(&s);
+                        sptrace!("monitoring_changed → {on}");
+                    }
+                }
             }
             _ => {}
         }
@@ -476,6 +515,12 @@ fn handle_cmd(s: &mut State, source: &str, body: &[u8]) {
             if let Some(i) = s.find(session_id) {
                 s.sessions[i].volume = volume;
                 mixer::set_gain(s.sessions[i].slot, volume as f32);
+                // 音量记忆：同一音效下次播放沿用（持久化到 soundVolumes）
+                let sid = s.sessions[i].sound_id.clone();
+                if s.volumes.get(&sid).copied().map_or(true, |old| (old - volume).abs() > 1e-6) {
+                    s.volumes.insert(sid, volume);
+                    persist_volumes(s);
+                }
                 send_to_peer(s, &protocol::ok_reply(req, "volume"));
                 push_state(s, 0);
             } else {
@@ -503,7 +548,7 @@ fn handle_ui(s: &mut State, action: protocol::UiAction) {
     match action {
         UiAction::Play { id } => {
             let req = NEXT_REQ.fetch_add(1, Ordering::Relaxed);
-            start_play(s, "ui", req, &id, 1.0, false, true);
+            start_play(s, "ui", req, &id, None, false, true);
         }
         UiAction::Stop { session_id } => match session_id {
             Some(sid) => {
@@ -521,8 +566,20 @@ fn handle_ui(s: &mut State, action: protocol::UiAction) {
     }
 }
 
-/// Start one voice. `from_ui` routes failures to the log instead of the phone.
-fn start_play(s: &mut State, source: &str, req: u64, id: &str, volume: f64, looping: bool, from_ui: bool) {
+/// Start one voice. `volume = None` → the per-sound remembered level (else
+/// 1.0); an explicit volume also updates the memory. `from_ui` routes
+/// failures to the log instead of the phone.
+fn start_play(s: &mut State, source: &str, req: u64, id: &str, volume: Option<f64>, looping: bool, from_ui: bool) {
+    let volume = match volume {
+        Some(v) => {
+            if s.volumes.get(id).copied().map_or(true, |old| (old - v).abs() > 1e-6) {
+                s.volumes.insert(id.to_string(), v);
+                persist_volumes(s);
+            }
+            v
+        }
+        None => s.volumes.get(id).copied().unwrap_or(1.0),
+    };
     let Some(worker) = s.worker.as_ref() else {
         fail_play(s, req, source, "worker not running", from_ui);
         return;
@@ -693,8 +750,8 @@ fn watchdog(s: &mut State) {
     }
 
     // 3) Local-output play/pause gate (worker applies it with a 3 s idle
-    //    hysteresis; pausing keeps the device stream alive but silent-free).
-    monitor::set_wanted(s.local_output && !s.sessions.is_empty());
+    //    hysteresis). Auto-suppressed while the host ear-return is on.
+    update_wanted(s);
 
     // 4) Periodic housekeeping (~every 2 s): full config re-read (JSON-edited
     //    changes also land without re-enabling) + rescan pacing.
@@ -721,6 +778,38 @@ fn watchdog(s: &mut State) {
 }
 
 // ─────────────────────────── outbound helpers ─────────────────────────────
+
+/// Safe read of the handle_event JSON argument.
+unsafe fn json_arg(p: *const c_char) -> Option<String> {
+    if p.is_null() {
+        return None;
+    }
+    let c = unsafe { std::ffi::CStr::from_ptr(p) };
+    c.to_str().ok().map(|s| s.to_string())
+}
+
+fn parse_enabled(json: &str) -> Option<bool> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    if let Some(b) = v.get("enabled").and_then(|x| x.as_bool()) {
+        return Some(b);
+    }
+    v.as_object()?
+        .values()
+        .find_map(|inner| inner.get("enabled").and_then(|x| x.as_bool()))
+}
+
+/// LOCAL_WANTED = user toggle ∧ no host ear-return ∧ live sessions.
+fn update_wanted(s: &State) {
+    let monitoring = HOST_MONITORING.load(std::sync::atomic::Ordering::Relaxed);
+    monitor::set_wanted(s.local_output && !monitoring && !s.sessions.is_empty());
+}
+
+/// Persist the per-sound volume memory (discrete user actions only).
+fn persist_volumes(s: &State) {
+    if let Ok(json) = serde_json::to_string(&s.volumes) {
+        abi::set_config("soundVolumes", &json);
+    }
+}
 
 fn send_to_peer(s: &State, msg: &serde_json::Value) {
     let bytes = msg.to_string();
@@ -774,7 +863,7 @@ fn sounds_json(s: &State) -> Vec<serde_json::Value> {
             w.registry
                 .list()
                 .iter()
-                .map(|e: &SoundEntry| protocol::sound_json(&e.id, &e.label, e.duration_ms))
+                .map(|e: &SoundEntry| protocol::sound_json(&e.id, &e.label, e.duration_ms, &e.dir))
                 .collect()
         })
         .unwrap_or_default()
@@ -826,7 +915,7 @@ fn write_panel_state(s: &mut State) {
             w.registry
                 .list()
                 .iter()
-                .map(|e| protocol::sound_json(&e.id, &e.label, e.duration_ms))
+                .map(|e| protocol::sound_json(&e.id, &e.label, e.duration_ms, &e.dir))
                 .collect()
         })
         .unwrap_or_default();
@@ -840,6 +929,7 @@ fn write_panel_state(s: &mut State) {
         "localOutput": s.local_output,
         "localVolume": s.local_volume,
         "localError": s.local_error,
+        "monitorOn": HOST_MONITORING.load(std::sync::atomic::Ordering::Relaxed),
     });
     let text = st.to_string();
     if text != s.last_panel_json {

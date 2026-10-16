@@ -6,10 +6,11 @@
 //! * Everything appended after `ctx` is declared `Option<fn>` and null-checked
 //!   before every call (same defensive pattern as Focus-Capture), so a host
 //!   that leaves an extension slot empty degrades gracefully.
-//! * We deliberately do NOT declare the API-version-2 control-plane fields
-//!   (`set_muted` … `set_dsp_settings`) we don't use: reading past the end of
-//!   a shorter host table would be out-of-bounds, so the struct stops at
-//!   `set_panel_icon` — the last field a v1 host is guaranteed to have.
+//! * The API-version-2 control-plane fields (`set_muted` …
+//!   `set_dsp_settings`) ARE declared (we read `get_monitoring`), but a v1
+//!   host table may end at `set_panel_icon` — reading past its end would be
+//!   out-of-bounds. They are therefore ONLY touched after [`detect_v2`]
+//!   confirmed `host_info().apiVersion >= 2` (append-only ABI rule).
 //!
 //! Threading contract (enforced by the crate, not just documented):
 //! host callbacks are ONLY invoked from `init`/`deinit`/`handle_message`/
@@ -90,6 +91,17 @@ pub struct mpl_host_api_t {
     pub clipboard_write: Option<unsafe extern "C" fn(*mut c_void, *const c_char) -> mpl_result_t>,
     pub set_panel_icon:
         Option<unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> mpl_result_t>,
+    // ── API version 2: control-plane signaling (appended; ONLY readable
+    // after `detect_v2()` confirmed host_info().apiVersion >= 2 — a v1 host
+    // table may end at set_panel_icon and reading further is OOB) ──
+    pub set_muted: Option<unsafe extern "C" fn(*mut c_void, u32) -> mpl_result_t>,
+    pub get_muted: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> mpl_result_t>,
+    pub set_monitoring: Option<unsafe extern "C" fn(*mut c_void, u32) -> mpl_result_t>,
+    pub get_monitoring: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> mpl_result_t>,
+    pub get_dsp_settings:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_char, *mut u32) -> mpl_result_t>,
+    pub set_dsp_settings:
+        Option<unsafe extern "C" fn(*mut c_void, *const c_char) -> mpl_result_t>,
 }
 
 // The table is a plain-old-data function-pointer bundle; the host keeps the
@@ -330,6 +342,58 @@ pub fn set_panel_icon(panel_id: &str, icon: &str) {
             unsafe { f(h.ctx, p.as_ptr(), i.as_ptr()) };
         }
     });
+}
+
+/// True once `detect_v2` saw `host_info().apiVersion >= 2` — gates every
+/// read of the appended control-plane slots.
+static HOST_V2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Probe `host_info()` (a v1-guaranteed slot) for the host API version and
+/// record whether the appended v2 control-plane fields are safe to read.
+/// Call once from `init` after `store_host`.
+pub fn detect_v2() -> bool {
+    let raw = with_host(|h| {
+        let Some(f) = h.host_info else {
+            return String::new();
+        };
+        let mut buf = [0u8; 256];
+        let mut size = buf.len() as u32;
+        let code = unsafe { f(h.ctx, buf.as_mut_ptr() as *mut c_char, &mut size) };
+        if code == mpl_result_t::MPL_OK {
+            let len = (size as usize).min(buf.len().saturating_sub(1));
+            String::from_utf8_lossy(&buf[..len]).into_owned()
+        } else {
+            String::new()
+        }
+    })
+    .unwrap_or_default();
+    let v = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|j| j.get("apiVersion").and_then(|x| x.as_u64()))
+        .unwrap_or(1);
+    let ok = v >= 2;
+    HOST_V2.store(ok, std::sync::atomic::Ordering::Release);
+    ok
+}
+
+pub fn host_has_v2() -> bool {
+    HOST_V2.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// `get_monitoring()` — host ear-return state. `None` when the host is API v1
+/// or lacks the slot / capability (`control.observe`); callers treat `None`
+/// as "unknown → do not suppress".
+pub fn get_monitoring() -> Option<bool> {
+    if !host_has_v2() {
+        return None;
+    }
+    with_host(|h| {
+        let f = h.get_monitoring?;
+        let mut out: u32 = 0;
+        let code = unsafe { f(h.ctx, &mut out) };
+        (code == mpl_result_t::MPL_OK).then_some(out != 0)
+    })
+    .flatten()
 }
 
 /// Read a NUL-terminated C string argument defensively (never panics).
