@@ -120,7 +120,7 @@ jobs:
       - name: 组装插件包目录（根即 plugin.json，可直接安装/导入）
         run: |
           mkdir -p stage
-          cp plugin.json panel.html README.md LICENSE stage/
+          cp plugin.json panel.html README.md LICENSE preview.jpg preview.png stage/
           cp libs_flat/soundpad.dll libs_flat/soundpad.so libs_flat/soundpad.dylib stage/
           ls -la stage/
 
