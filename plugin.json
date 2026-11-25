@@ -12,7 +12,6 @@
     "zh-CN": "Soundpad",
     "en": "Soundpad"
   },
-  "author": "OrientCOMPASS",
   "license": "Unlicense",
   "runtime": "native",
   "entry": "soundpad",
